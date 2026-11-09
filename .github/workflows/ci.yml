@@ -105,8 +105,8 @@ jobs:
           docker exec lds lds export > backup.txt
           cat backup.txt
           docker exec lds lds rm files.home.lan nas.home.lan '*.home.lan'
-          docker cp backup.txt lds:/tmp/backup.txt
-          docker exec lds lds import /tmp/backup.txt
+          sudo cp backup.txt data/backup.txt
+          docker exec lds lds import /data/backup.txt
           expect files.home.lan A 10.0.0.10
           expect nas.home.lan AAAA fd00::10
 

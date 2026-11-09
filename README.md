@@ -447,7 +447,7 @@ lds export > records-backup.txt
 `lds import` reads that file back, on this server or another one:
 
 ```sh
-cp records-backup.txt data/
+sudo cp records-backup.txt data/
 lds import /data/records-backup.txt
 ```
 
