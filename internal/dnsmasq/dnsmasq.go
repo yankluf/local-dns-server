@@ -69,6 +69,10 @@ func Render(cfg config.DNSmasq, records []store.Record) (f Files, skipped []erro
 	b.WriteString("pid-file=\n")
 	b.WriteString("no-resolv\nno-hosts\ndomain-needed\nbogus-priv\n")
 	fmt.Fprintf(&b, "cache-size=%d\n", cfg.CacheSize)
+	if cfg.LocalTTL > 0 {
+		// How long clients may remember answers for our own records.
+		fmt.Fprintf(&b, "local-ttl=%d\n", cfg.LocalTTL)
+	}
 	for _, u := range cfg.Upstreams {
 		fmt.Fprintf(&b, "server=%s\n", u)
 	}
@@ -191,7 +195,12 @@ type Manager struct {
 	exited      chan struct{}
 	status      Status
 	lastRestart time.Time
+	noSignal    bool // LDS may not signal dnsmasq (missing KILL capability)
 }
+
+// noSignalMsg explains the one thing that stops LDS from restarting dnsmasq.
+const noSignalMsg = "LDS isn't allowed to stop dnsmasq, so wildcard, alias and settings changes can't be applied. " +
+	"Add KILL to cap_add in docker-compose.yml and recreate the container"
 
 // NewManager returns a manager for the given settings.
 func NewManager(cfg config.DNSmasq) *Manager {
@@ -276,7 +285,9 @@ func (m *Manager) Run(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			m.mu.Lock()
-			m.stopLocked()
+			if err := m.stopLocked(); err != nil {
+				log.Print(err)
+			}
 			m.mu.Unlock()
 			return
 		case <-t.C:
@@ -315,29 +326,16 @@ func (m *Manager) Apply(f Files) error {
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if err := os.MkdirAll(m.cfg.HostsDir, 0o755); err != nil {
-		return m.fail(err)
-	}
+	prev := m.current
 	if hostsChanged || m.current.Hosts == "" {
-		// Write outside the watched folder, then rename in, so dnsmasq never
-		// reads a half-written file.
-		tmp := filepath.Join(filepath.Dir(m.cfg.ConfigPath), "."+HostsFile+".tmp")
-		if err := store.WriteFileDurable(tmp, []byte(f.Hosts), 0o644); err != nil {
+		if err := m.writeHostsLocked(f.Hosts); err != nil {
 			return m.fail(err)
 		}
-		if err := os.Rename(tmp, m.hostsPath()); err != nil {
-			return m.fail(err)
-		}
-		_ = store.SyncDir(m.cfg.HostsDir)
 	}
 	if confChanged {
-		if err := store.WriteFileDurable(m.cfg.ConfigPath+".tmp", []byte(f.Conf), 0o644); err != nil {
+		if err := m.writeConfLocked(f.Conf); err != nil {
 			return m.fail(err)
 		}
-		if err := os.Rename(m.cfg.ConfigPath+".tmp", m.cfg.ConfigPath); err != nil {
-			return m.fail(err)
-		}
-		_ = store.SyncDir(filepath.Dir(m.cfg.ConfigPath))
 	}
 	m.current = f
 	m.status.LastReload = time.Now().UTC()
@@ -346,27 +344,94 @@ func (m *Manager) Apply(f Files) error {
 		return nil
 	}
 	if confChanged {
-		m.stopLocked()
+		if err := m.stopLocked(); err != nil {
+			// The old dnsmasq is still running with the old config: keep
+			// describing that state, so the next change tries again.
+			m.current = prev
+			if prev.Conf != "" {
+				_ = m.writeConfLocked(prev.Conf)
+			}
+			return m.fail(err)
+		}
 		if err := m.startLocked(); err != nil {
 			return m.fail(err)
 		}
 		m.lastRestart = time.Now()
 		m.status.LastRestart = m.lastRestart.UTC()
 		// Catch a dnsmasq that dies right away (e.g. port 53 already taken).
-		exited := m.exited
+		cmd, exited := m.cmd, m.exited
 		m.mu.Unlock()
+		died := false
 		select {
 		case <-exited:
-			m.mu.Lock()
-			return m.fail(errors.New("dnsmasq exited right after starting; see the log"))
+			died = true
 		case <-time.After(300 * time.Millisecond):
 		}
 		m.mu.Lock()
+		if died {
+			err := errors.New("dnsmasq exited right after starting; see the log")
+			// Go back to the config that was running a moment ago, so DNS
+			// stays up while the problem is looked at.
+			if prev.Conf != "" && prev.Conf != f.Conf && m.restoreLocked(prev) == nil {
+				err = fmt.Errorf("%w. Went back to the previous config", err)
+			}
+			return m.fail(err)
+		}
+		// By now dnsmasq has switched to its own user. Check that LDS can
+		// still signal it; without that, the next restart would fail.
+		m.noSignal = cmd != nil && errors.Is(cmd.Process.Signal(syscall.Signal(0)), syscall.EPERM)
+		if m.noSignal {
+			log.Print("WARNING: " + noSignalMsg)
+		}
 	}
 	m.status.Degraded = ""
+	if m.noSignal {
+		m.status.Degraded = noSignalMsg
+	}
 	// Remember this as the last working config.
 	_ = store.WriteFileDurable(m.goodConf(), []byte(f.Conf), 0o644)
 	_ = store.WriteFileDurable(m.goodHosts(), []byte(f.Hosts), 0o644)
+	return nil
+}
+
+// writeHostsLocked replaces the hosts file. It's written outside the watched
+// folder and renamed in, so dnsmasq never reads a half-written file.
+func (m *Manager) writeHostsLocked(hosts string) error {
+	if err := os.MkdirAll(m.cfg.HostsDir, 0o755); err != nil {
+		return err
+	}
+	tmp := filepath.Join(filepath.Dir(m.cfg.ConfigPath), "."+HostsFile+".tmp")
+	if err := store.WriteFileDurable(tmp, []byte(hosts), 0o644); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, m.hostsPath()); err != nil {
+		return err
+	}
+	return store.SyncDir(m.cfg.HostsDir)
+}
+
+func (m *Manager) writeConfLocked(conf string) error {
+	if err := store.WriteFileDurable(m.cfg.ConfigPath+".tmp", []byte(conf), 0o644); err != nil {
+		return err
+	}
+	if err := os.Rename(m.cfg.ConfigPath+".tmp", m.cfg.ConfigPath); err != nil {
+		return err
+	}
+	return store.SyncDir(filepath.Dir(m.cfg.ConfigPath))
+}
+
+// restoreLocked puts a previous config back and starts dnsmasq with it.
+func (m *Manager) restoreLocked(prev Files) error {
+	if err := m.writeHostsLocked(prev.Hosts); err != nil {
+		return err
+	}
+	if err := m.writeConfLocked(prev.Conf); err != nil {
+		return err
+	}
+	if err := m.startLocked(); err != nil {
+		return err
+	}
+	m.current = prev
 	return nil
 }
 
@@ -379,30 +444,59 @@ func (m *Manager) Status() Status {
 	return s
 }
 
-// Probe sends a real DNS query to dnsmasq and reports whether it answered.
-func (m *Manager) Probe(ctx context.Context) error {
-	if !m.cfg.Enabled {
-		return nil
-	}
+// resolver returns a DNS client that only talks to our dnsmasq.
+func (m *Manager) resolver() *net.Resolver {
 	addr := "127.0.0.1"
 	if len(m.cfg.Listen) > 0 {
 		addr = m.cfg.Listen[0]
 	}
 	target := net.JoinHostPort(addr, strconv.Itoa(m.cfg.Port))
-	r := &net.Resolver{PreferGo: true, Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
-		return (&net.Dialer{}).DialContext(ctx, "udp", target)
+	return &net.Resolver{PreferGo: true, Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
+		if !strings.HasPrefix(network, "tcp") {
+			network = "udp"
+		}
+		return (&net.Dialer{}).DialContext(ctx, network, target)
 	}}
+}
+
+// Probe sends a real DNS query to dnsmasq and reports whether it answered.
+func (m *Manager) Probe(ctx context.Context) error {
+	if !m.cfg.Enabled {
+		return nil
+	}
 	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
 	// A single-label name: with domain-needed, dnsmasq answers it locally
 	// (NXDOMAIN) without asking upstream, whatever zones are configured. The
 	// trailing dot stops the resolver from adding search domains.
-	_, err := r.LookupHost(ctx, "lds-health-check.")
+	_, err := m.resolver().LookupHost(ctx, "lds-health-check.")
 	var dnsErr *net.DNSError
 	if err == nil || (errors.As(err, &dnsErr) && dnsErr.IsNotFound) {
 		return nil // an answer, even "no such name", means dnsmasq is serving
 	}
 	return fmt.Errorf("dnsmasq didn't answer a test query: %w", err)
+}
+
+// ErrNotManaged is returned by Lookup when LDS doesn't run dnsmasq.
+var ErrNotManaged = errors.New("dnsmasq isn't run by LDS here, so the name can't be looked up")
+
+// Lookup asks dnsmasq for name, the same way a device on the network would,
+// and returns the addresses it answers with (none if there's no such name).
+func (m *Manager) Lookup(ctx context.Context, name string) ([]string, error) {
+	if !m.cfg.Enabled {
+		return nil, ErrNotManaged
+	}
+	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	addrs, err := m.resolver().LookupHost(ctx, name+".")
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) && dnsErr.IsNotFound {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, errors.New("dnsmasq didn't answer")
+	}
+	return addrs, nil
 }
 
 func (m *Manager) fail(err error) error {
@@ -438,19 +532,41 @@ func (m *Manager) startLocked() error {
 	return nil
 }
 
-func (m *Manager) stopLocked() {
+// stopLocked stops dnsmasq and waits for it to be gone. It never waits
+// forever: if dnsmasq can't be signalled (it runs as another user, so LDS
+// needs the KILL capability) it gives up with an error and keeps tracking
+// the process that is still running.
+func (m *Manager) stopLocked() error {
 	if m.cmd == nil {
-		return
+		return nil
 	}
 	cmd, exited := m.cmd, m.exited
-	m.cmd = nil
-	_ = cmd.Process.Signal(syscall.SIGTERM)
-	select {
-	case <-exited:
-	case <-time.After(5 * time.Second):
-		_ = cmd.Process.Kill()
-		<-exited
+	gone := func(wait time.Duration) bool {
+		select {
+		case <-exited:
+			return true
+		case <-time.After(wait):
+			return false
+		}
 	}
+	m.cmd = nil // tells the waiter this exit is deliberate
+	err := cmd.Process.Signal(syscall.SIGTERM)
+	if err == nil && !gone(5*time.Second) {
+		err = cmd.Process.Kill()
+	}
+	if (err == nil || errors.Is(err, os.ErrProcessDone)) && gone(5*time.Second) {
+		return nil
+	}
+	m.cmd = cmd
+	if errors.Is(err, syscall.EPERM) {
+		m.noSignal = true
+		m.status.Degraded = noSignalMsg
+		return errors.New(noSignalMsg)
+	}
+	if err == nil {
+		err = errors.New("it didn't exit")
+	}
+	return fmt.Errorf("can't stop dnsmasq (pid %d): %v", cmd.Process.Pid, err)
 }
 
 type prefixWriter struct{ prefix string }

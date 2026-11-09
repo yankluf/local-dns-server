@@ -56,7 +56,7 @@
     <input class="c-comment" name="comment" placeholder="Comment (optional)" aria-label="Comment">
     <button class="primary" type="submit">Add record</button>
   </form>
-  <p class="hint" id="hint">An IP makes an A record, a hostname makes a CNAME, and a name starting with <b>*.</b> covers a whole domain.</p>
+  <p class="hint" id="hint">An IP makes an A record (a name can have one IPv4 and one IPv6 address), a hostname makes a CNAME, and a name starting with <b>*.</b> covers a whole domain.</p>
 
   <div class="tools">
     <input type="search" id="q" placeholder="Filter by name, IP or container" aria-label="Filter records">
@@ -69,6 +69,13 @@
   </div>
 
   <div id="records"></div>
+
+  <form class="check" id="check" autocomplete="off">
+    <label for="check-name">Check a name</label>
+    <input class="mono" id="check-name" name="name" placeholder="grafana.home.lan" spellcheck="false" required>
+    <button type="submit">Check</button>
+    <span class="hint" id="check-result" aria-live="polite"></span>
+  </form>
   </div>
   </div>
 </main>

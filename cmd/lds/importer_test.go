@@ -3,6 +3,8 @@ package main
 import (
 	"reflect"
 	"testing"
+
+	"github.com/yankluf/local-dns-server/internal/store"
 )
 
 func TestParseImportCustomList(t *testing.T) {
@@ -47,5 +49,32 @@ func TestParseImportPiholeTOML(t *testing.T) {
 	}
 	if got := ParseImport(in, true); !reflect.DeepEqual(got, want) {
 		t.Errorf("got  %v\nwant %v", got, want)
+	}
+}
+
+// An export must import back to the same records, comments included.
+func TestExportRoundTrip(t *testing.T) {
+	view := func(typ, name, value, comment, source string) store.View {
+		return store.View{Record: store.Record{Type: typ, Name: name, Value: value, Comment: comment, Source: source}, Active: true}
+	}
+	records := []store.View{
+		view(store.TypeCNAME, "files.home.lan", "nas.home.lan", "", store.SourceManual),
+		view(store.TypeA, "nas.home.lan", "10.0.0.10", "the NAS # in the closet", store.SourceManual),
+		view(store.TypeAAAA, "nas.home.lan", "fd00::10", "", store.SourceManual),
+		view(store.TypeWildcard, "*.home.lan", "10.0.0.5", "Traefik", store.SourceManual),
+		view(store.TypeA, "app.home.lan", "10.0.0.5", "", store.SourceDocker),
+		view(store.TypeA, "evil.home.lan\naddress=/#/6.6.6.6", "10.0.0.5", "", store.SourceManual),
+	}
+	want := [][3]string{
+		{"nas.home.lan", "10.0.0.10", "the NAS # in the closet"},
+		{"nas.home.lan", "fd00::10", ""},
+		{"*.home.lan", "10.0.0.5", "Traefik"},
+		{"files.home.lan", "nas.home.lan", ""},
+	}
+	if got := parseImport(exportText(records, false), false); !reflect.DeepEqual(got, want) {
+		t.Errorf("got  %v\nwant %v\nfile:\n%s", got, want, exportText(records, false))
+	}
+	if got := parseImport(exportText(records, true), false); len(got) != len(want)+1 {
+		t.Errorf("--all: got %v", got)
 	}
 }

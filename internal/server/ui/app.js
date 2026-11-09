@@ -179,15 +179,40 @@ async function load() {
 function renderStatus(s) {
   const items = [];
   const d = s.dnsmasq;
-  if (d && d.enabled) items.push(el("li", { class: d.running ? "ok" : "bad", title: d.last_error || "" },
-    d.running ? `dnsmasq running, reloaded ${ago(d.last_reload)}` : `dnsmasq stopped${d.last_error ? ": " + d.last_error : ""}`));
-  else items.push(el("li", {}, "dnsmasq not managed"));
+  if (d && d.enabled) {
+    items.push(el("li", { class: d.running ? "ok" : "bad", title: d.last_error || "" },
+      d.running ? `dnsmasq running, reloaded ${ago(d.last_reload)}` : `dnsmasq stopped${d.last_error ? ": " + d.last_error : ""}`));
+    if (d.degraded) items.push(el("li", { class: "bad" }, d.degraded));
+  } else items.push(el("li", {}, "dnsmasq not managed"));
   const k = s.docker;
   if (k && k.enabled) items.push(el("li", { class: k.connected ? "ok" : "bad", title: k.last_error || "" },
     k.connected ? `Docker synced ${ago(k.last_sync)}` : "Docker unreachable"));
+  const p = s.replica;
+  if (p) items.push(el("li", { class: p.last_error ? "bad" : "ok" },
+    `Copied from the primary ${ago(p.last_sync)}${p.last_error ? ": " + p.last_error : ""}`));
   if (s.upstreams && s.upstreams.length) items.push(el("li", { class: "ok" }, "Forwarding to " + s.upstreams.join(", ")));
   $("#status").replaceChildren(...items);
 }
+
+$("#check").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const out = $("#check-result");
+  try {
+    const r = await api("GET", "/api/check?name=" + encodeURIComponent(e.target.elements.name.value.trim()));
+    const why = (r.records || []).map((x) => `${x.name} → ${x.value}`).join(", then ");
+    let msg = r.error ? `${r.name}: ${r.error}`
+      : r.answers && r.answers.length ? `${r.name} resolves to ${r.answers.join(", ")}`
+      : r.in_zone ? `${r.name} doesn't resolve` : `${r.name} isn't answered here`;
+    if (why) msg += ` (because of ${why})`;
+    if (r.note) msg += `: ${r.note}`;
+    out.textContent = msg + ".";
+    out.classList.toggle("error", !!r.error);
+  } catch (err) {
+    if (err instanceof AuthError) { clearToken(); showSignin("Your token was not accepted. Sign in again."); return; }
+    out.textContent = err.message;
+    out.classList.add("error");
+  }
+});
 
 $("#add").addEventListener("submit", async (e) => {
   e.preventDefault();

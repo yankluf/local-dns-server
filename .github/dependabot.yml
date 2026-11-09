@@ -1,0 +1,16 @@
+# Keeps the pinned images and CI actions current. Each update arrives as a
+# pull request, and CI builds and tests the real stack before it is merged.
+version: 2
+updates:
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+  - package-ecosystem: docker-compose
+    directory: /
+    schedule:
+      interval: weekly
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

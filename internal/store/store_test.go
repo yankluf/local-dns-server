@@ -238,7 +238,7 @@ func TestReadOnlyReplica(t *testing.T) {
 	if _, err := s.Add(mustNew(t, "a.home.lan", "1.1.1.1")); !errors.Is(err, ErrReadOnly) {
 		t.Errorf("replica accepted a change: %v", err)
 	}
-	if ch, err := s.SetReplica([]Record{mustNew(t, "a.home.lan", "1.1.1.1"), {Type: TypeA, Name: "evil.com", Value: "6.6.6.6"}}); !ch || err != nil {
+	if ch, skipped, err := s.SetReplica([]Record{mustNew(t, "a.home.lan", "1.1.1.1"), {Type: TypeA, Name: "evil.com", Value: "6.6.6.6"}}); !ch || skipped != 1 || err != nil {
 		t.Fatalf("SetReplica: %v %v", ch, err)
 	}
 	if v := s.List(); len(v) != 1 || v[0].Source != SourceReplica {
@@ -274,5 +274,92 @@ func TestLoopOnDiskNotServed(t *testing.T) {
 	}
 	if _, err := s.Remove("l1.home.lan"); err != nil {
 		t.Errorf("can't remove loop member: %v", err)
+	}
+}
+
+func TestDualStack(t *testing.T) {
+	s, _ := open(t, Options{})
+	v4, err := s.Add(mustNew(t, "nas.home.lan", "10.0.0.10"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Add(mustNew(t, "nas.home.lan", "fd00::10")); err != nil {
+		t.Fatalf("IPv6 next to IPv4: %v", err)
+	}
+	for _, v := range []string{"10.0.0.11", "fd00::11", "x.home.lan"} {
+		if _, err := s.Add(mustNew(t, "nas.home.lan", v)); !errors.Is(err, ErrExists) {
+			t.Errorf("second %s accepted: %v", v, err)
+		}
+	}
+	if got, err := s.Remove(v4.ID); err != nil || len(got) != 1 || got[0].Type != TypeA {
+		t.Fatalf("remove by ID: %v %v", got, err)
+	}
+	s.Add(mustNew(t, "nas.home.lan", "10.0.0.10"))
+	if got, err := s.Remove("nas.home.lan"); err != nil || len(got) != 2 || len(s.List()) != 0 {
+		t.Errorf("remove by name: %v %v", got, err)
+	}
+}
+
+func TestDockerLimit(t *testing.T) {
+	s, _ := open(t, Options{MaxRecords: 2})
+	a, b, c := mustNew(t, "a.home.lan", "10.0.0.1"), mustNew(t, "b.home.lan", "10.0.0.1"), mustNew(t, "c.home.lan", "10.0.0.1")
+	if _, err := s.SetDocker([]Record{a, b}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.SetDocker([]Record{a, b, c}); err == nil || len(s.Active()) != 2 {
+		t.Errorf("over the limit: err=%v active=%d", err, len(s.Active()))
+	}
+}
+
+func TestReplicaKeepsBothAddresses(t *testing.T) {
+	s, _ := open(t, Options{ReadOnly: true})
+	recs := []Record{mustNew(t, "nas.home.lan", "10.0.0.10"), mustNew(t, "nas.home.lan", "fd00::10"), mustNew(t, "nas.home.lan", "fd00::10")}
+	ch, skipped, err := s.SetReplica(recs)
+	if !ch || skipped != 1 || err != nil || len(s.Active()) != 2 {
+		t.Fatalf("SetReplica: %v %d %v, %d active", ch, skipped, err, len(s.Active()))
+	}
+	seen := map[string]bool{}
+	for _, v := range s.List() {
+		if seen[v.ID] {
+			t.Errorf("duplicate ID %s", v.ID)
+		}
+		seen[v.ID] = true
+	}
+	if ch, _, _ := s.SetReplica(recs); ch {
+		t.Error("the same records counted as a change")
+	}
+}
+
+func TestExplain(t *testing.T) {
+	s, _ := open(t, Options{})
+	for _, p := range [][2]string{
+		{"*.home.lan", "10.0.0.5"}, {"*.apps.home.lan", "10.0.0.6"}, {"nas.home.lan", "10.0.0.10"},
+		{"files.home.lan", "nas.home.lan"}, {"lost.home.lan", "gone.home.lan"},
+	} {
+		if _, err := s.Add(mustNew(t, p[0], p[1])); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for name, want := range map[string]string{
+		"nas.home.lan":    "nas.home.lan",
+		"files.home.lan":  "files.home.lan,nas.home.lan",
+		"x.apps.home.lan": "*.apps.home.lan",
+		"other.home.lan":  "*.home.lan",
+		"home.lan":        "*.home.lan",
+		"lost.home.lan":   "lost.home.lan,*.home.lan",
+		"www.example.com": "",
+		"nothome.lan":     "",
+	} {
+		recs, _ := s.Explain(name)
+		var got []string
+		for _, r := range recs {
+			got = append(got, r.Name)
+		}
+		if strings.Join(got, ",") != want {
+			t.Errorf("Explain(%s) = %v, want %s", name, got, want)
+		}
+	}
+	if _, in := s.Explain("www.example.com"); in {
+		t.Error("example.com reported as inside the zones")
 	}
 }

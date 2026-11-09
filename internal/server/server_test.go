@@ -142,14 +142,76 @@ func TestTokenRequired(t *testing.T) {
 	}
 }
 
-// Brute force: 10 wrong tokens lock the address out, even for the right token.
+// Brute force: after 10 wrong tokens an address gets one try per second.
+// The right token still gets in, so a guesser sharing the admin's address
+// can't lock the admin out.
 func TestTokenGuessingLimited(t *testing.T) {
 	h := newServer(t, nil)
+	guess := map[string]string{"Authorization": "Bearer guess"}
 	for i := 0; i < 10; i++ {
-		do(h, req{"GET", "/api/records", "", map[string]string{"Authorization": "Bearer guess"}})
+		if w := do(h, req{"GET", "/api/records", "", guess}); w.Code != http.StatusUnauthorized {
+			t.Fatalf("guess %d: got %d", i, w.Code)
+		}
 	}
-	if w := do(h, req{"GET", "/api/records", "", map[string]string{"Authorization": "Bearer " + token}}); w.Code != http.StatusTooManyRequests {
-		t.Errorf("after 10 failures: got %d", w.Code)
+	if w := do(h, req{"GET", "/api/records", "", map[string]string{"Authorization": "Bearer " + token}}); w.Code != http.StatusOK {
+		t.Errorf("right token after 10 failures: got %d", w.Code)
+	}
+	for i := 0; i < 5; i++ {
+		if w := do(h, req{"GET", "/api/records", "", guess}); w.Code != http.StatusTooManyRequests {
+			t.Errorf("guess inside the same second was checked: got %d", w.Code)
+		}
+	}
+}
+
+// One name can hold an IPv4 and an IPv6 address; removing by name removes both.
+func TestDualStackAndRemove(t *testing.T) {
+	h := newServer(t, nil)
+	for body, want := range map[string]int{
+		`{"name":"nas.home.lan","value":"10.0.0.10"}`: http.StatusCreated,
+		`{"name":"nas.home.lan","value":"fd00::10"}`:  http.StatusCreated,
+	} {
+		if w := do(h, req{"POST", "/api/records", body, authJSON(nil)}); w.Code != want {
+			t.Fatalf("%s: %d %s", body, w.Code, w.Body)
+		}
+	}
+	for _, body := range []string{
+		`{"name":"nas.home.lan","value":"10.0.0.11"}`,
+		`{"name":"nas.home.lan","value":"other.home.lan"}`,
+	} {
+		if w := do(h, req{"POST", "/api/records", body, authJSON(nil)}); w.Code != http.StatusConflict {
+			t.Errorf("%s: got %d", body, w.Code)
+		}
+	}
+	w := do(h, req{"DELETE", "/api/records/nas.home.lan", "", authJSON(nil)})
+	if w.Code != 200 || !strings.Contains(w.Body.String(), "10.0.0.10") || !strings.Contains(w.Body.String(), "fd00::10") {
+		t.Errorf("remove: %d %s", w.Code, w.Body)
+	}
+}
+
+func TestCheck(t *testing.T) {
+	h := newServer(t, nil)
+	auth := map[string]string{"Authorization": "Bearer " + token}
+	for _, body := range []string{
+		`{"name":"*.home.lan","value":"10.0.0.5"}`,
+		`{"name":"nas.home.lan","value":"10.0.0.10"}`,
+		`{"name":"files.home.lan","value":"nas.home.lan"}`,
+	} {
+		do(h, req{"POST", "/api/records", body, authJSON(nil)})
+	}
+	for path, want := range map[string]string{
+		"/api/check?name=files.home.lan":  `"value": "10.0.0.10"`,
+		"/api/check?name=Other.home.lan.": `"name": "*.home.lan"`,
+		"/api/check?name=example.com":     `"in_zone": false`,
+	} {
+		if w := do(h, req{"GET", path, "", auth}); w.Code != 200 || !strings.Contains(w.Body.String(), want) {
+			t.Errorf("%s: %d %s", path, w.Code, w.Body)
+		}
+	}
+	if w := do(h, req{"GET", "/api/check?name=bad%0Aname", "", auth}); w.Code != http.StatusBadRequest {
+		t.Errorf("bad name: %d", w.Code)
+	}
+	if w := do(h, req{"GET", "/api/check?name=nas.home.lan", "", nil}); w.Code != http.StatusUnauthorized {
+		t.Errorf("no token: %d", w.Code)
 	}
 }
 

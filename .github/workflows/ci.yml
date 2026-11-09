@@ -1,0 +1,152 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.x"
+          cache: false
+      # With dnsmasq installed the tests also start a real dnsmasq.
+      - name: Install dnsmasq
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends dnsmasq-base
+      - name: Format
+        run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+      - name: Vet
+        run: go vet ./...
+      - name: Test
+        run: go test -race ./...
+      - name: Known vulnerabilities
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+
+  # Builds the image and runs docker-compose.yml exactly as shipped (same
+  # capabilities, read-only filesystem and Docker proxy), then checks real
+  # DNS answers on port 53.
+  stack:
+    name: Real stack
+    runs-on: ubuntu-24.04
+    env:
+      COMPOSE_PROJECT_NAME: lds
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build and pull images
+        run: |
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends dnsutils
+          cat > docker-compose.override.yml <<'YAML'
+          services:
+            lds:
+              environment:
+                LDS_ZONES: home.lan
+                LDS_DOCKER_TARGET: 10.0.0.7
+          YAML
+          docker compose build
+          docker compose pull docker-proxy
+          docker pull busybox:stable
+          docker pull curlimages/curl:latest
+
+      - name: Free port 53
+        run: sudo systemctl disable --now systemd-resolved
+
+      - name: Start
+        run: |
+          docker compose up -d
+          for i in $(seq 1 60); do
+            [ "$(docker inspect -f '{{.State.Health.Status}}' lds)" = healthy ] && exit 0
+            sleep 2
+          done
+          echo "LDS never became healthy"; exit 1
+
+      - name: Records resolve
+        run: |
+          expect() { # expect <name> <type> <answer>
+            for i in $(seq 1 15); do
+              got=$(dig +short +time=2 +tries=1 @127.0.0.1 "$1" "$2" | tail -n1)
+              [ "$got" = "$3" ] && { echo "ok: $1 $2 -> $3"; return 0; }
+              sleep 1
+            done
+            echo "FAIL: $1 $2 answered '$got', wanted '$3'"; return 1
+          }
+          docker exec lds lds add nas.home.lan 10.0.0.10
+          docker exec lds lds add nas.home.lan fd00::10
+          expect nas.home.lan A 10.0.0.10
+          expect nas.home.lan AAAA fd00::10
+          # Wildcards and aliases need a dnsmasq restart: this is the path
+          # that needs the KILL capability.
+          docker exec lds lds add '*.home.lan' 10.0.0.5
+          docker exec lds lds add files.home.lan nas.home.lan -c "an alias"
+          expect anything.home.lan A 10.0.0.5
+          expect files.home.lan A 10.0.0.10
+          expect nas.home.lan A 10.0.0.10
+          out=$(docker exec lds lds check files.home.lan); echo "$out"
+          case "$out" in *"resolves to 10.0.0.10"*) ;; *) exit 1 ;; esac
+          # Settings changes restart dnsmasq too.
+          token=$(docker exec lds cat /data/admin-token)
+          curl -fsS -X PUT -H "Authorization: Bearer $token" -H "Content-Type: application/json" \
+            -d '{"set":{"local_ttl":300}}' http://127.0.0.1:5380/api/settings > /dev/null
+          for i in $(seq 1 15); do
+            dig +noall +answer @127.0.0.1 nas.home.lan A | grep -Eq '[[:space:]]300[[:space:]]' && break
+            [ "$i" = 15 ] && { echo "FAIL: local TTL not applied"; exit 1; }
+            sleep 1
+          done
+          curl -fsS -H "Authorization: Bearer $token" http://127.0.0.1:5380/api/status | tee status.json
+          if grep -q '"degraded"' status.json; then echo "FAIL: dnsmasq is degraded"; exit 1; fi
+          # Backup and restore.
+          docker exec lds lds export > backup.txt
+          cat backup.txt
+          docker exec lds lds rm files.home.lan nas.home.lan '*.home.lan'
+          docker cp backup.txt lds:/tmp/backup.txt
+          docker exec lds lds import /tmp/backup.txt
+          expect files.home.lan A 10.0.0.10
+          expect nas.home.lan AAAA fd00::10
+
+      - name: Docker discovery through the proxy
+        run: |
+          docker run -d --name web -l 'traefik.http.routers.web.rule=Host(`web.home.lan`)' busybox:stable sleep 600
+          for i in $(seq 1 30); do
+            got=$(dig +short +time=2 +tries=1 @127.0.0.1 web.home.lan A | tail -n1)
+            [ "$got" = 10.0.0.7 ] && break
+            [ "$i" = 30 ] && { echo "FAIL: web.home.lan answered '$got'"; exit 1; }
+            sleep 1
+          done
+          out=$(docker exec lds lds check web.home.lan); echo "$out"
+          case "$out" in *"docker:web"*) ;; *) exit 1 ;; esac
+          docker rm -f web
+          for i in $(seq 1 30); do
+            got=$(dig +short +time=2 +tries=1 @127.0.0.1 web.home.lan A | tail -n1)
+            [ "$got" = 10.0.0.5 ] && break # back to the wildcard
+            [ "$i" = 30 ] && { echo "FAIL: web.home.lan still answers '$got'"; exit 1; }
+            sleep 1
+          done
+
+      - name: The proxy refuses everything else
+        run: |
+          code() { # code <method> <path>
+            docker run --rm --user 0 --network none -v lds_docker-proxy:/p curlimages/curl:latest \
+              -s -o /dev/null -w '%{http_code}' -X "$1" --unix-socket /p/docker.sock "http://docker$2"
+          }
+          [ "$(code GET /containers/json)" = 200 ]
+          [ "$(code GET /v1.41/containers/json)" = 200 ]
+          for path in /images/json /info /containers/lds/json /v1.41/secrets /containers/json/x; do
+            c=$(code GET "$path"); echo "GET $path -> $c"
+            [ "$c" = 403 ] || exit 1
+          done
+          for path in /containers/create /containers/lds/stop /containers/json; do
+            c=$(code POST "$path"); echo "POST $path -> $c"
+            [ "$c" = 403 ] || [ "$c" = 405 ] || exit 1
+          done
+          [ "$(docker inspect -f '{{.State.Status}}' lds)" = running ]
+
+      - name: Logs
+        if: always()
+        run: docker compose logs --no-color || true

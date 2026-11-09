@@ -4,7 +4,9 @@ package replica
 
 import (
 	"context"
+	"fmt"
 	"log"
+	"slices"
 	"sync"
 	"time"
 
@@ -25,6 +27,8 @@ type Follower struct {
 	client *client.Client
 	store  *store.Store
 	every  time.Duration
+	// setZones, if set, makes this server answer for the primary's domains.
+	setZones func([]string) error
 
 	mu     sync.Mutex
 	status Status
@@ -34,6 +38,10 @@ type Follower struct {
 func New(url, token string, st *store.Store, every time.Duration) *Follower {
 	return &Follower{client: client.New(url, token), store: st, every: every, status: Status{Primary: url}}
 }
+
+// CopyZones makes the follower keep this server's domains equal to the
+// primary's, so a replica needs no domain setup of its own.
+func (f *Follower) CopyZones(set func([]string) error) { f.setZones = set }
 
 // Status returns the replication state.
 func (f *Follower) Status() any {
@@ -58,28 +66,57 @@ func (f *Follower) Run(ctx context.Context) {
 }
 
 func (f *Follower) sync() {
-	views, err := f.client.List()
-	if err == nil {
-		var recs []store.Record
-		for _, v := range views {
-			if v.Active {
-				recs = append(recs, v.Record)
-			}
+	accepted, skipped, err := f.pull()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	switch {
+	case err != nil:
+		log.Printf("replica: %v (still serving the last copy)", err)
+		f.status.LastError = err.Error()
+		return
+	case skipped > 0:
+		msg := fmt.Sprintf("%d of the primary's record(s) were left out because they aren't valid on this server", skipped)
+		if f.status.LastError != msg {
+			log.Printf("replica: %s", msg)
 		}
-		var changed bool
-		changed, err = f.store.SetReplica(recs)
-		if err == nil {
-			if changed {
-				log.Printf("replica: copied %d record(s) from the primary", len(recs))
+		f.status.LastError = msg
+	default:
+		f.status.LastError = ""
+	}
+	f.status.LastSync, f.status.Records = time.Now().UTC(), accepted
+}
+
+// pull copies the primary's domains and active records.
+func (f *Follower) pull() (accepted, skipped int, err error) {
+	if f.setZones != nil {
+		zones, err := f.client.Zones()
+		if err != nil {
+			return 0, 0, err
+		}
+		if len(zones) > 0 && !slices.Equal(zones, f.store.Zones()) {
+			if err := f.setZones(zones); err != nil {
+				return 0, 0, fmt.Errorf("can't use the primary's domains: %w", err)
 			}
-			f.mu.Lock()
-			f.status.LastSync, f.status.LastError, f.status.Records = time.Now().UTC(), "", len(recs)
-			f.mu.Unlock()
-			return
+			log.Printf("replica: now using the primary's domains (%v)", zones)
 		}
 	}
-	log.Printf("replica: %v (still serving the last copy)", err)
-	f.mu.Lock()
-	f.status.LastError = err.Error()
-	f.mu.Unlock()
+	views, err := f.client.List()
+	if err != nil {
+		return 0, 0, err
+	}
+	var recs []store.Record
+	for _, v := range views {
+		if v.Active {
+			recs = append(recs, v.Record)
+		}
+	}
+	changed, skipped, err := f.store.SetReplica(recs)
+	if err != nil {
+		return 0, skipped, err
+	}
+	accepted = len(recs) - skipped
+	if changed {
+		log.Printf("replica: copied %d record(s) from the primary", accepted)
+	}
+	return accepted, skipped, nil
 }

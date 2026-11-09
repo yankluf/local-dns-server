@@ -22,6 +22,9 @@ import (
 // MinTokenLength is the shortest accepted API token.
 const MinTokenLength = 16
 
+// MaxLocalTTL is the longest lifetime (in seconds) for local answers.
+const MaxLocalTTL = 86400
+
 // Config holds the settings for `lds serve`.
 type Config struct {
 	HTTPListen     string        // LDS_HTTP_LISTEN
@@ -54,6 +57,7 @@ type DNSmasq struct {
 	LogQueries     bool     // LDS_LOG_QUERIES
 	DNSSEC         bool     // LDS_DNSSEC
 	StopRebind     bool     // LDS_STOP_DNS_REBIND
+	LocalTTL       int      // LDS_LOCAL_TTL: seconds clients may remember local answers (0 = don't)
 	ExtraDir       string   // LDS_DNSMASQ_EXTRA_DIR: included with conf-dir if it exists
 	Zones          []string // copied from Config.Zones
 	ConfigPath     string   // <data>/dnsmasq.conf
@@ -148,14 +152,16 @@ func FromEnv() (Config, error) {
 	d.LogQueries = b("LDS_LOG_QUERIES", false)
 	d.DNSSEC = b("LDS_DNSSEC", true)
 	d.StopRebind = b("LDS_STOP_DNS_REBIND", true)
+	d.LocalTTL = i("LDS_LOCAL_TTL", 0, 0, MaxLocalTTL)
 	d.ExtraDir = env("LDS_DNSMASQ_EXTRA_DIR", "/etc/dnsmasq.d")
 	d.RestartSpacing = time.Duration(i("LDS_RESTART_SPACING_MS", 2000, 0, 60000)) * time.Millisecond
 	for _, l := range envList("LDS_DNS_LISTEN", "") {
-		if _, err := names.ParseIP(l); err != nil {
+		ip, err := names.ParseIP(l)
+		if err != nil {
 			errs = append(errs, fmt.Errorf("LDS_DNS_LISTEN: %w", err))
 			continue
 		}
-		d.Listen = append(d.Listen, l)
+		d.Listen = append(d.Listen, ip.String())
 	}
 	d.Upstreams = envList("LDS_UPSTREAMS", "1.1.1.1,1.0.0.1,9.9.9.9")
 	if err := names.SafePath(c.DataDir); err != nil {
@@ -209,11 +215,13 @@ func (c *Config) finish() []error {
 
 	var ups []string
 	for _, u := range c.DNSmasq.Upstreams {
-		if err := validUpstream(u); err != nil {
+		// Keep the cleaned-up form, never the text as typed.
+		clean, err := cleanUpstream(u)
+		if err != nil {
 			errs = append(errs, fmt.Errorf("upstreams: %w", err))
 			continue
 		}
-		ups = append(ups, u)
+		ups = append(ups, clean)
 	}
 	c.DNSmasq.Upstreams = ups
 	if len(ups) == 0 {
@@ -221,6 +229,9 @@ func (c *Config) finish() []error {
 	}
 	if c.DNSmasq.CacheSize < 0 || c.DNSmasq.CacheSize > 100000 {
 		errs = append(errs, errors.New("cache size must be from 0 to 100000"))
+	}
+	if c.DNSmasq.LocalTTL < 0 || c.DNSmasq.LocalTTL > MaxLocalTTL {
+		errs = append(errs, fmt.Errorf("local answer lifetime must be from 0 to %d seconds", MaxLocalTTL))
 	}
 	if c.MaxRecords < 1 || c.MaxRecords > 1_000_000 {
 		errs = append(errs, errors.New("record limit must be from 1 to 1000000"))
@@ -266,6 +277,7 @@ type Overrides struct {
 	StopRebind           *bool     `json:"stop_dns_rebind,omitempty"`
 	CacheSize            *int      `json:"cache_size,omitempty"`
 	LogQueries           *bool     `json:"log_queries,omitempty"`
+	LocalTTL             *int      `json:"local_ttl,omitempty"`
 	MaxRecords           *int      `json:"max_records,omitempty"`
 }
 
@@ -298,24 +310,30 @@ func (c Config) WithOverrides(o Overrides) (Config, error) {
 	if o.LogQueries != nil {
 		c.DNSmasq.LogQueries = *o.LogQueries
 	}
+	if o.LocalTTL != nil {
+		c.DNSmasq.LocalTTL = *o.LocalTTL
+	}
 	if o.MaxRecords != nil {
 		c.MaxRecords = *o.MaxRecords
 	}
 	return c, errors.Join(c.finish()...)
 }
 
-// validUpstream accepts "IP" or "IP#port".
-func validUpstream(s string) error {
+// cleanUpstream accepts "IP" or "IP#port" and returns it in canonical form.
+func cleanUpstream(s string) (string, error) {
 	host, port, hasPort := strings.Cut(s, "#")
-	if _, err := names.ParseIP(host); err != nil {
-		return err
+	ip, err := names.ParseIP(host)
+	if err != nil {
+		return "", err
 	}
-	if hasPort {
-		if n, err := strconv.Atoi(port); err != nil || n < 1 || n > 65535 {
-			return fmt.Errorf("%q: bad port", s)
-		}
+	if !hasPort {
+		return ip.String(), nil
 	}
-	return nil
+	n, err := strconv.Atoi(strings.TrimSpace(port))
+	if err != nil || n < 1 || n > 65535 {
+		return "", fmt.Errorf("%q: bad port", names.CleanText(s, 60))
+	}
+	return ip.String() + "#" + strconv.Itoa(n), nil
 }
 
 // IsLoopback reports whether a host (optionally with port) is a loopback address.

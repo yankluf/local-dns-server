@@ -14,7 +14,18 @@ var (
 // ParseImport extracts (name, value) pairs from Pi-hole and dnsmasq files.
 // Host records come before CNAMEs so aliases point at names that exist.
 func ParseImport(data string, isTOML bool) [][2]string {
-	var hosts, cnames [][2]string
+	var out [][2]string
+	for _, e := range parseImport(data, isTOML) {
+		out = append(out, [2]string{e[0], e[1]})
+	}
+	return out
+}
+
+// parseImport is ParseImport plus each record's comment: the text after a
+// "#" at the end of its line (which is how `lds export` writes comments).
+func parseImport(data string, isTOML bool) [][3]string {
+	var hosts, cnames [][3]string
+	comment := ""
 	addHosts := func(line string) {
 		f := strings.Fields(line)
 		if len(f) < 2 {
@@ -27,7 +38,7 @@ func ParseImport(data string, isTOML bool) [][2]string {
 			if name == "localhost" || strings.HasPrefix(name, "#") {
 				break
 			}
-			hosts = append(hosts, [2]string{name, f[0]})
+			hosts = append(hosts, [3]string{name, f[0], comment})
 		}
 	}
 	addCNAME := func(spec string) {
@@ -41,7 +52,7 @@ func ParseImport(data string, isTOML bool) [][2]string {
 		}
 		target := strings.TrimSpace(parts[len(parts)-1])
 		for _, a := range parts[:len(parts)-1] {
-			cnames = append(cnames, [2]string{strings.TrimSpace(a), target})
+			cnames = append(cnames, [3]string{strings.TrimSpace(a), target, comment})
 		}
 	}
 
@@ -63,6 +74,11 @@ func ParseImport(data string, isTOML bool) [][2]string {
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
+		comment = ""
+		if i := strings.Index(line, " #"); i >= 0 {
+			comment = strings.TrimSpace(line[i+2:])
+			line = strings.TrimSpace(line[:i])
+		}
 		switch {
 		case strings.HasPrefix(line, "cname="):
 			addCNAME(strings.TrimPrefix(line, "cname="))
@@ -79,14 +95,14 @@ func ParseImport(data string, isTOML bool) [][2]string {
 			}
 			for _, n := range names {
 				for _, ip := range ips {
-					hosts = append(hosts, [2]string{n, ip})
+					hosts = append(hosts, [3]string{n, ip, comment})
 				}
 			}
 		case strings.HasPrefix(line, "address=/"):
 			// address=/domain/ip -> wildcard
 			parts := strings.Split(strings.TrimPrefix(line, "address="), "/")
 			if len(parts) == 3 && parts[1] != "" && parts[2] != "" {
-				hosts = append(hosts, [2]string{"*." + parts[1], parts[2]})
+				hosts = append(hosts, [3]string{"*." + parts[1], parts[2], comment})
 			}
 		default:
 			addHosts(line)

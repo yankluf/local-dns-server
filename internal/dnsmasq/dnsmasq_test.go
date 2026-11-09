@@ -57,6 +57,7 @@ func freePort(t *testing.T) int {
 func TestRender(t *testing.T) {
 	cfg := testCfg(t)
 	cfg.Listen = nil
+	cfg.LocalTTL = 300
 	f, skipped := Render(cfg, recs(t, "*.home.lan", "10.0.0.5", "nas.home.lan", "10.0.0.10", "v6.home.lan", "fd00::1", "files.home.lan", "nas.home.lan"))
 	if len(skipped) != 0 {
 		t.Fatal(skipped)
@@ -64,7 +65,7 @@ func TestRender(t *testing.T) {
 	for _, want := range []string{
 		"address=/home.lan/10.0.0.5\n", "cname=files.home.lan,nas.home.lan\n", "local=/home.lan/\n",
 		"local-service\n", "dnssec\n", "trust-anchor=.,38696,", "stop-dns-rebind\n", "rebind-domain-ok=/home.lan/\n",
-		"hostsdir=" + cfg.HostsDir + "\n",
+		"hostsdir=" + cfg.HostsDir + "\n", "local-ttl=300\n",
 	} {
 		if !strings.Contains(f.Conf, want) {
 			t.Errorf("config missing %q", want)

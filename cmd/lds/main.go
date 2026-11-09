@@ -40,15 +40,18 @@ const usage = `LDS (Local DNS Server) manages local DNS records served by dnsmas
 Usage:
   lds serve                         Run the DNS server and web UI
   lds add <name> <value> [-c text]  Add a record
-  lds rm <name|id>                  Remove a record
+  lds rm <name|id>                  Remove a record (a name removes its IPv4 and IPv6 address)
   lds list [--json] [--source s]    List records (s: manual, docker or replica)
-  lds import <file>                 Import records from Pi-hole or a hosts file
+  lds check <name>                  Show what a name resolves to, and which record decides it
+  lds import <file>                 Import records from Pi-hole, a hosts file or an export
+  lds export [--all]                Print your records as a file "lds import" can read (a backup)
   lds healthcheck                   Exit 0 if the local server answers DNS (for Docker)
   lds version
 
 The record type comes from the name and value:
   lds add '*.home.lan' 192.168.1.5          wildcard: home.lan and every subdomain
-  lds add nas.home.lan 192.168.1.10         A record (an IPv6 address makes AAAA)
+  lds add nas.home.lan 192.168.1.10         A record (an IPv6 address makes AAAA;
+                                            one name can have one of each)
   lds add grafana.home.lan nas.home.lan     CNAME to another local record
 
 Client commands talk to the server at --server, $LDS_URL or
@@ -74,6 +77,10 @@ func main() {
 		err = list(args)
 	case "import":
 		err = importFile(args)
+	case "export":
+		err = export(args)
+	case "check":
+		err = check(args)
 	case "healthcheck":
 		err = healthcheck()
 	case "version", "--version":
@@ -188,6 +195,11 @@ func serve() error {
 	var follower *replica.Follower
 	if cfg.ReplicaOf != "" {
 		follower = replica.New(cfg.ReplicaOf, cfg.Token, st, cfg.ReplicaEvery)
+		// A replica answers for the same domains as its primary.
+		follower.CopyZones(func(zones []string) error {
+			_, err := sm.Update(settings.Change{Set: config.Overrides{Zones: &zones}})
+			return err
+		})
 		log.Printf("read-only replica of %s", cfg.ReplicaOf)
 		if strings.HasPrefix(cfg.ReplicaOf, "http://") {
 			log.Print("note: the replica sends the token to the primary over plain HTTP; use https:// for the primary if the network isn't trusted")
@@ -405,13 +417,105 @@ func remove(args []string) error {
 	}
 	c := newClient()
 	for _, key := range pos {
-		r, err := c.Remove(key)
+		removed, err := c.Remove(key)
 		if err != nil {
 			return err
 		}
-		fmt.Printf("removed %s %s -> %s\n", clean(r.Type), clean(r.Name), clean(r.Value))
+		for _, r := range removed {
+			fmt.Printf("removed %s %s -> %s\n", clean(r.Type), clean(r.Name), clean(r.Value))
+		}
 	}
 	return nil
+}
+
+// check prints what the server answers for a name and which record decides it.
+func check(args []string) error {
+	fs := flag.NewFlagSet("check", flag.ExitOnError)
+	newClient := clientFlags(fs)
+	pos, err := parse(fs, args)
+	if err != nil {
+		return err
+	}
+	if len(pos) != 1 {
+		return errors.New("usage: lds check <name>")
+	}
+	res, err := newClient().Check(pos[0])
+	if err != nil {
+		return err
+	}
+	switch {
+	case res.Error != "":
+		fmt.Printf("%s: %s\n", clean(res.Name), clean(res.Error))
+	case len(res.Answers) > 0:
+		fmt.Printf("%s resolves to %s\n", clean(res.Name), clean(strings.Join(res.Answers, ", ")))
+	case res.InZone:
+		fmt.Printf("%s doesn't resolve\n", clean(res.Name))
+	default:
+		fmt.Printf("%s isn't answered here\n", clean(res.Name))
+	}
+	for _, r := range res.Records {
+		src := r.Source
+		if r.Container != "" {
+			src += ":" + r.Container
+		}
+		fmt.Printf("  because of %s %s -> %s (%s)\n", clean(r.Type), clean(r.Name), clean(r.Value), clean(src))
+	}
+	if res.Note != "" {
+		fmt.Printf("  note: %s\n", clean(res.Note))
+	}
+	return nil
+}
+
+// export prints the records as a file `lds import` reads back.
+func export(args []string) error {
+	fs := flag.NewFlagSet("export", flag.ExitOnError)
+	all := fs.Bool("all", false, "also include records found through Docker")
+	newClient := clientFlags(fs)
+	if _, err := parse(fs, args); err != nil {
+		return err
+	}
+	records, err := newClient().List()
+	if err != nil {
+		return err
+	}
+	fmt.Print(exportText(records, *all))
+	return nil
+}
+
+// exportText renders records in the dnsmasq/hosts syntax ParseImport reads.
+// Docker records are left out unless all is set: they come back on their own.
+func exportText(records []store.View, all bool) string {
+	var hosts, wild, cnames []string
+	for _, r := range records {
+		if r.Source == store.SourceDocker && (!all || !r.Active) {
+			continue
+		}
+		// Names and values were validated by the server; clean them anyway
+		// so a hostile server can't smuggle extra lines into the file.
+		name, value, note := names.CleanText(r.Name, 300), names.CleanText(r.Value, 300), ""
+		if strings.ContainsAny(name+value, " #,/") && r.Type != store.TypeWildcard || strings.ContainsAny(name+value, " #,") {
+			continue
+		}
+		if c := names.CleanText(r.Comment, store.MaxCommentLength); c != "" {
+			note = " # " + c
+		}
+		switch r.Type {
+		case store.TypeWildcard:
+			wild = append(wild, "address=/"+strings.TrimPrefix(name, "*.")+"/"+value+note)
+		case store.TypeCNAME:
+			cnames = append(cnames, "cname="+name+","+value+note)
+		default:
+			hosts = append(hosts, value+" "+name+note)
+		}
+	}
+	var b strings.Builder
+	b.WriteString("# LDS records. Restore with: lds import <this file>\n")
+	for _, group := range [][]string{hosts, wild, cnames} {
+		for _, line := range group {
+			b.WriteString(line + "\n")
+		}
+	}
+	return b.String()
 }
 
 func list(args []string) error {
@@ -475,13 +579,14 @@ Understands:
   Pi-hole v6 pihole.toml             (dns.hosts and dns.cnameRecords)
   Pi-hole v5 custom.list / hosts     ("192.168.1.10 nas.lan")
   dnsmasq conf (05-pihole-custom-cname.conf etc.)
-                                     (cname=, host-record=, address=/domain/ip)`)
+                                     (cname=, host-record=, address=/domain/ip)
+  the output of "lds export"`)
 	}
 	data, err := os.ReadFile(pos[0])
 	if err != nil {
 		return err
 	}
-	pairs := ParseImport(string(data), strings.HasSuffix(pos[0], ".toml"))
+	pairs := parseImport(string(data), strings.HasSuffix(pos[0], ".toml"))
 	if len(pairs) == 0 {
 		return errors.New("no records found in " + pos[0])
 	}
@@ -492,7 +597,11 @@ Understands:
 			fmt.Printf("would add %s -> %s\n", clean(p[0]), clean(p[1]))
 			continue
 		}
-		r, err := c.Add(p[0], p[1], "imported")
+		comment := p[2]
+		if comment == "" {
+			comment = "imported"
+		}
+		r, err := c.Add(p[0], p[1], comment)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "skip %s -> %s: %v\n", clean(p[0]), clean(p[1]), err)
 			skipped++

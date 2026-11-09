@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 
@@ -163,8 +164,23 @@ func (m *Manager) Update(ch Change) (Result, error) {
 	if m.Apply != nil {
 		m.Apply(cfg)
 	}
-	log.Printf("settings changed from the dashboard")
 	return Result{Applied: true, Warnings: warnings, Fields: describe(m.base, next, cfg)}, nil
+}
+
+// Keys lists the settings a change touches, for the change log.
+func (ch Change) Keys() []string {
+	var set map[string]json.RawMessage
+	data, _ := json.Marshal(ch.Set)
+	_ = json.Unmarshal(data, &set)
+	keys := make([]string, 0, len(set)+len(ch.Reset))
+	for k, v := range set {
+		keys = append(keys, k+"="+string(v))
+	}
+	sort.Strings(keys)
+	for _, k := range ch.Reset {
+		keys = append(keys, k+"=(reset)")
+	}
+	return keys
 }
 
 // Fields describes every setting for the dashboard.
@@ -199,6 +215,9 @@ func merge(o, set config.Overrides) config.Overrides {
 	if set.LogQueries != nil {
 		o.LogQueries = set.LogQueries
 	}
+	if set.LocalTTL != nil {
+		o.LocalTTL = set.LocalTTL
+	}
 	if set.MaxRecords != nil {
 		o.MaxRecords = set.MaxRecords
 	}
@@ -223,6 +242,8 @@ func clear(o *config.Overrides, key string) error {
 		o.CacheSize = nil
 	case "log_queries":
 		o.LogQueries = nil
+	case "local_ttl":
+		o.LocalTTL = nil
 	case "max_records":
 		o.MaxRecords = nil
 	default:
@@ -280,6 +301,9 @@ func describe(base config.Config, o config.Overrides, c config.Config) []Field {
 		{Key: "max_records", Group: "Records", Label: "Record limit", Kind: "int", Env: "LDS_MAX_RECORDS", Editable: true,
 			Value: c.MaxRecords, Source: src(o.MaxRecords != nil, "LDS_MAX_RECORDS"),
 			Help: "Most records that can be added by hand."},
+		{Key: "local_ttl", Group: "Records", Label: "Answer lifetime (seconds)", Kind: "int", Env: "LDS_LOCAL_TTL", Editable: true,
+			Value: c.DNSmasq.LocalTTL, Source: src(o.LocalTTL != nil, "LDS_LOCAL_TTL"),
+			Help: "How long devices may remember your records. 0 means they always ask again, so changes show up at once. A small number like 30 keeps apps working through a short restart."},
 
 		{Key: "upstreams", Group: "Internet lookups", Label: "Upstream DNS servers", Kind: "list", Env: "LDS_UPSTREAMS", Editable: true,
 			Value: list(c.DNSmasq.Upstreams), Source: src(o.Upstreams != nil, "LDS_UPSTREAMS"),

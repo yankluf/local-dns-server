@@ -63,10 +63,36 @@ func (c *Client) Add(name, value, comment string) (store.View, error) {
 	return out, c.do(http.MethodPost, "/api/records", in, &out)
 }
 
-// Remove deletes a manual record by name or ID.
-func (c *Client) Remove(key string) (store.Record, error) {
-	var out store.Record
-	return out, c.do(http.MethodDelete, "/api/records/"+url.PathEscape(key), nil, &out)
+// Remove deletes manual records by name or ID and returns what was removed.
+func (c *Client) Remove(key string) ([]store.Record, error) {
+	var out struct {
+		Removed []store.Record `json:"removed"`
+	}
+	return out.Removed, c.do(http.MethodDelete, "/api/records/"+url.PathEscape(key), nil, &out)
+}
+
+// CheckResult is what the server knows about one name.
+type CheckResult struct {
+	Name    string         `json:"name"`
+	InZone  bool           `json:"in_zone"`
+	Answers []string       `json:"answers"`
+	Records []store.Record `json:"records"`
+	Note    string         `json:"note,omitempty"`
+	Error   string         `json:"error,omitempty"`
+}
+
+// Check asks the server what it answers for name, and why.
+func (c *Client) Check(name string) (CheckResult, error) {
+	var out CheckResult
+	return out, c.do(http.MethodGet, "/api/check?name="+url.QueryEscape(name), nil, &out)
+}
+
+// Zones returns the domains the server answers for.
+func (c *Client) Zones() ([]string, error) {
+	var out struct {
+		Zones []string `json:"zones"`
+	}
+	return out.Zones, c.do(http.MethodGet, "/api/status", nil, &out)
 }
 
 func (c *Client) do(method, path string, in, out any) error {

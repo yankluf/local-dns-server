@@ -102,6 +102,7 @@ func TestWithOverrides(t *testing.T) {
 		"no upstreams": {Upstreams: &[]string{}},
 		"bad target":   {DockerTarget: ptr("fe80::1%x")},
 		"cache":        {CacheSize: ptr(-5)},
+		"ttl":          {LocalTTL: ptr(MaxLocalTTL + 1)},
 		"limit":        {MaxRecords: ptr(0)},
 	} {
 		if _, err := base.WithOverrides(o); err == nil {
@@ -111,3 +112,27 @@ func TestWithOverrides(t *testing.T) {
 }
 
 func ptr[T any](v T) *T { return &v }
+
+// Upstreams are stored in one canonical form, so what is checked is exactly
+// what is written to the dnsmasq config.
+func TestUpstreamsNormalized(t *testing.T) {
+	ups, ttl := []string{" 9.9.9.9#053 ", "2620:FE::FE", "::ffff:1.1.1.1"}, 300
+	setEnv(t, nil)
+	base, err := FromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := base.WithOverrides(Overrides{Upstreams: &ups, LocalTTL: &ttl})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"9.9.9.9#53", "2620:fe::fe", "1.1.1.1"}
+	for i, w := range want {
+		if c.DNSmasq.Upstreams[i] != w {
+			t.Errorf("upstream %d = %q, want %q", i, c.DNSmasq.Upstreams[i], w)
+		}
+	}
+	if c.DNSmasq.LocalTTL != 300 {
+		t.Errorf("local TTL = %d", c.DNSmasq.LocalTTL)
+	}
+}

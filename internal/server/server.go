@@ -4,17 +4,23 @@
 //   - security headers on every response (CSP, no framing, no sniffing)
 //   - Host header allowlist, which defeats DNS rebinding
 //   - for changes: same-origin check and a JSON-only body, which defeat CSRF
-//   - bearer token, with failed attempts rate limited per client IP
+//   - bearer token. After too many wrong tokens an address is slowed to one
+//     try per second, so guessing is hopeless but the right token still gets
+//     in (someone sharing the address can't lock the admin out)
 //   - a global rate limit on changes
+//
+// Every change is written to the log with the address it came from.
 package server
 
 import (
+	"context"
 	"crypto/subtle"
 	"embed"
 	"encoding/json"
 	"errors"
 	"io"
 	"io/fs"
+	"log"
 	"mime"
 	"net"
 	"net/http"
@@ -53,6 +59,10 @@ type Server struct {
 	failures failureLimiter
 	writes   *bucket
 	initOnce sync.Once
+
+	healthMu  sync.Mutex
+	healthAt  time.Time
+	healthErr error
 }
 
 // Handler returns the HTTP handler.
@@ -66,6 +76,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/records", s.read(s.list))
 	mux.HandleFunc("POST /api/records", s.write(s.add))
 	mux.HandleFunc("DELETE /api/records/{key}", s.write(s.remove))
+	mux.HandleFunc("GET /api/check", s.read(s.check))
 	mux.HandleFunc("GET /api/status", s.read(s.statusHandler))
 	mux.HandleFunc("GET /api/settings", s.read(s.getSettings))
 	mux.HandleFunc("PUT /api/settings", s.write(s.putSettings))
@@ -189,15 +200,16 @@ func (s *Server) authorized(w http.ResponseWriter, r *http.Request) bool {
 		return true // LDS_INSECURE_NO_AUTH
 	}
 	ip := clientIP(r)
-	if s.failures.blocked(ip) {
-		w.Header().Set("Retry-After", "300")
-		writeError(w, http.StatusTooManyRequests, errors.New("too many wrong tokens from this address; try again later"))
+	header := r.Header.Get("Authorization")
+	if header != "" && !s.failures.allow(ip) {
+		w.Header().Set("Retry-After", "1")
+		writeError(w, http.StatusTooManyRequests, errors.New("too many wrong tokens from this address; slow down"))
 		return false
 	}
-	got, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
+	got, ok := strings.CutPrefix(header, "Bearer ")
 	if !ok || subtle.ConstantTimeCompare([]byte(got), []byte(s.Token)) != 1 {
-		if ok || r.Header.Get("Authorization") != "" {
-			s.failures.add(ip)
+		if header != "" && s.failures.add(ip) {
+			log.Printf("audit: %s sent too many wrong tokens; its tries are now limited to one per second", ip)
 		}
 		w.Header().Set("WWW-Authenticate", `Bearer realm="lds"`)
 		writeError(w, http.StatusUnauthorized, errors.New("missing or wrong token"))
@@ -249,6 +261,7 @@ func (s *Server) add(w http.ResponseWriter, r *http.Request) {
 		writeError(w, statusFor(err), err)
 		return
 	}
+	log.Printf("audit: %s added %s %s -> %s", clientIP(r), rec.Type, rec.Name, rec.Value)
 	// Return the view so the caller sees any warning about the new record.
 	for _, v := range s.Store.List() {
 		if v.ID == rec.ID {
@@ -260,12 +273,49 @@ func (s *Server) add(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) remove(w http.ResponseWriter, r *http.Request) {
-	rec, err := s.Store.Remove(r.PathValue("key"))
+	removed, err := s.Store.Remove(r.PathValue("key"))
 	if err != nil {
 		writeError(w, statusFor(err), err)
 		return
 	}
-	writeJSON(w, http.StatusOK, rec)
+	for _, rec := range removed {
+		log.Printf("audit: %s removed %s %s -> %s", clientIP(r), rec.Type, rec.Name, rec.Value)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"removed": removed})
+}
+
+// check reports what dnsmasq answers for a name and which records decide it.
+func (s *Server) check(w http.ResponseWriter, r *http.Request) {
+	name := names.Normalize(r.URL.Query().Get("name"))
+	if err := names.ValidHostname(name); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	matched, inZone := s.Store.Explain(name)
+	out := map[string]any{"name": name, "in_zone": inZone, "answers": []string{}, "records": []store.Record{}}
+	if matched != nil {
+		out["records"] = matched
+	}
+	if !inZone {
+		// Not ours: looking it up would turn this endpoint into a way to
+		// send queries to the upstream servers.
+		out["note"] = "outside this server's domains, so it is passed on to the upstream DNS servers"
+		writeJSON(w, http.StatusOK, out)
+		return
+	}
+	if s.DNSmasq != nil {
+		answers, err := s.DNSmasq.Lookup(r.Context(), name)
+		switch {
+		case err != nil:
+			out["error"] = err.Error()
+		case len(answers) > 0:
+			out["answers"] = answers
+		}
+	}
+	if len(matched) == 0 {
+		out["note"] = "no record matches this name"
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 func statusFor(err error) int {
@@ -330,13 +380,25 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
+	if !ch.DryRun {
+		log.Printf("audit: %s changed settings: %s", clientIP(r), names.CleanText(strings.Join(ch.Keys(), ", "), 500))
+	}
 	writeJSON(w, http.StatusOK, res)
 }
 
-// healthz answers "ok" only if dnsmasq actually answers a DNS query.
+// healthz answers "ok" only if dnsmasq actually answers a DNS query. The
+// result is reused for a few seconds, so hammering this open endpoint can't
+// flood dnsmasq with test queries.
 func (s *Server) healthz(w http.ResponseWriter, r *http.Request) {
 	if s.DNSmasq != nil {
-		if err := s.DNSmasq.Probe(r.Context()); err != nil {
+		s.healthMu.Lock()
+		if time.Since(s.healthAt) > 3*time.Second {
+			s.healthErr = s.DNSmasq.Probe(context.WithoutCancel(r.Context()))
+			s.healthAt = time.Now()
+		}
+		err := s.healthErr
+		s.healthMu.Unlock()
+		if err != nil {
 			http.Error(w, "dns not answering", http.StatusServiceUnavailable)
 			return
 		}
@@ -357,7 +419,7 @@ func writeError(w http.ResponseWriter, code int, err error) {
 	writeJSON(w, code, map[string]string{"error": names.CleanText(err.Error(), 500)})
 }
 
-// failureLimiter blocks a client IP after too many wrong tokens.
+// failureLimiter slows down a client IP after too many wrong tokens.
 type failureLimiter struct {
 	mu     sync.Mutex
 	max    int
@@ -368,23 +430,36 @@ type failureLimiter struct {
 type failure struct {
 	count int
 	start time.Time
+	last  time.Time // last try let through while slowed down
 }
 
-func (l *failureLimiter) blocked(ip string) bool {
+// allow reports whether a token from ip may be checked now. An address over
+// the limit gets one try per second instead of none, so the real admin
+// (who may share the address with whoever is guessing) still gets in.
+func (l *failureLimiter) allow(ip string) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	f, ok := l.hits[ip]
 	if !ok {
-		return false
+		return true
 	}
-	if time.Since(f.start) > l.window {
+	now := time.Now()
+	if now.Sub(f.start) > l.window {
 		delete(l.hits, ip)
+		return true
+	}
+	if f.count < l.max {
+		return true
+	}
+	if now.Sub(f.last) < time.Second {
 		return false
 	}
-	return f.count >= l.max
+	f.last = now
+	return true
 }
 
-func (l *failureLimiter) add(ip string) {
+// add counts a wrong token and reports whether ip just reached the limit.
+func (l *failureLimiter) add(ip string) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if len(l.hits) > 10000 { // keep memory bounded
@@ -396,13 +471,14 @@ func (l *failureLimiter) add(ip string) {
 	}
 	f, ok := l.hits[ip]
 	if !ok && len(l.hits) > 10000 {
-		return // still full of recent offenders; the token length makes guessing hopeless anyway
+		return false // still full of recent offenders; the token length makes guessing hopeless anyway
 	}
 	if !ok || time.Since(f.start) > l.window {
 		f = &failure{start: time.Now()}
 		l.hits[ip] = f
 	}
 	f.count++
+	return f.count == l.max
 }
 
 // bucket is a token-bucket rate limiter.

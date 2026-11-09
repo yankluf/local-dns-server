@@ -50,6 +50,9 @@ button.primary { background: var(--ink); color: var(--bg); }
 
 .tools { display: flex; flex-wrap: wrap; gap: 10px 16px; align-items: center; margin: 32px 0 8px; }
 .tools input { max-width: 320px; background: var(--surface); }
+form.check { display: flex; flex-wrap: wrap; gap: 8px 10px; align-items: center; margin: 32px 0 8px; font-size: .875rem; color: var(--muted); }
+form.check input { max-width: 260px; background: var(--surface); }
+form.check .hint { margin: 0; flex-basis: 100%; }
 .filters { display: flex; gap: 6px; flex-wrap: wrap; }
 .filters button { font-weight: 400; font-size: .875rem; padding: 5px 12px; background: transparent; border-color: var(--line); color: var(--muted); }
 .filters button[aria-pressed="true"] { background: var(--surface); color: var(--ink); border-color: var(--ink); }

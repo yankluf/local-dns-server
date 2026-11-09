@@ -209,6 +209,10 @@ type Container struct {
 }
 
 func (w *Watcher) discover(ctx context.Context) ([]store.Record, error) {
+	// A proxy that accepts the connection but never answers must not stall
+	// discovery for good.
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, w.base+"/containers/json", nil)
 	resp, err := w.client.Do(req)
 	if err != nil {

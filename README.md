@@ -36,6 +36,7 @@ the same DNS engine Pi-hole uses.
 - [The web page](#the-web-page)
 - [Automatic records from Docker](#automatic-records-from-docker)
 - [Moving from Pi-hole](#moving-from-pi-hole)
+- [Backing up and moving records](#backing-up-and-moving-records)
 - [A second server](#a-second-server)
 - [Security](#security)
 - [Command reference](#command-reference)
@@ -177,6 +178,7 @@ work out of the box, why, and how to turn it on.
 | **Using the CLI from another computer** | The CLI needs to know where the server is and what the token is. | `LDS_URL` and `LDS_TOKEN_FILE`, see [the CLI](#using-the-cli-from-another-computer) |
 | **More than 5000 records** | A limit stops anyone flooding LDS. | **Settings → Record limit**, or `LDS_MAX_RECORDS` |
 | **Ad-blocking** | LDS doesn't block ads. | **Settings → Upstream DNS servers**: use a filtering service like AdGuard DNS (`94.140.14.14, 94.140.15.15`) |
+| **Clients remembering answers** | Local answers have a lifetime of 0, so a changed record is seen right away. | **Settings → Answer lifetime**, or `LDS_LOCAL_TTL: 300` |
 | **DHCP or other dnsmasq extras** | Not part of LDS. | Add `.conf` files to `./dnsmasq.d/`; for DHCP also add `NET_ADMIN` and `NET_RAW` to `cap_add` |
 
 ### Also worth knowing
@@ -218,6 +220,15 @@ Use `-c` to remember what a record is for:
 lds add nas.home.lan 192.168.1.10 -c "Synology in the closet"
 ```
 
+### IPv4 and IPv6 for the same name
+
+A name can have one IPv4 address and one IPv6 address. Just add both:
+
+```sh
+lds add nas.home.lan 192.168.1.10
+lds add nas.home.lan fd00::10
+```
+
 ### Remove a record
 
 Use its name or its ID (shown by `lds list`):
@@ -225,6 +236,20 @@ Use its name or its ID (shown by `lds list`):
 ```sh
 lds rm nas.home.lan
 ```
+
+Removing by name removes everything with that name (both addresses, if it
+has two). Removing by ID removes just that one. LDS prints what it removed.
+
+### Check a name
+
+Not sure why a name goes where it goes? Ask:
+
+```sh
+lds check grafana.home.lan
+```
+
+It shows what LDS answers for that name and which record decides it (its own
+record, a CNAME, or a wildcard). It only works for names inside your domains.
 
 ### See your records
 
@@ -235,7 +260,7 @@ lds list
 ```
 NAME              TYPE      VALUE         SOURCE          ID                       NOTE
 *.home.lan        WILDCARD  192.168.1.5   manual          3c6633be5a1f09d2         Traefik
-grafana.home.lan  A         192.168.1.5   docker:grafana  docker:grafana.home.lan
+grafana.home.lan  A         192.168.1.5   docker:grafana  docker:a:grafana.home.lan
 nas.home.lan      A         192.168.1.10  manual          8ed5116e02b7c4a1         Synology in the closet
 ```
 
@@ -250,7 +275,8 @@ to use the list in a script.
   `nas.home.lan → 192.168.1.10`, the NAS gets its own IP and everything else
   goes to Traefik.
 - **A record you add yourself beats one from Docker** with the same name.
-- **Names must be unique.** To change a record, remove it and add it again.
+- **Names must be unique**, except that a name can have one IPv4 and one IPv6
+  address. To change a record, remove it and add it again.
 - **Every change is tested before it's saved.** If dnsmasq wouldn't accept
   it, you get an error and nothing changes.
 
@@ -285,8 +311,11 @@ Open `http://<your-server-ip>:5380` and sign in with your token.
 - **Remove a record** with the button on its row. Records from Docker show
   "auto" instead, because they come from your containers.
 - **Filter** by name, IP or container, or show only manual or Docker records.
+- **Check a name** with the box under the list. It shows what LDS answers
+  for that name and which record decides it.
 - **The top line shows whether things are healthy**: whether DNS is running,
-  when Docker was last checked, and where other lookups are sent.
+  when Docker was last checked, where other lookups are sent, and on a second
+  server, when it last copied the first one. Problems show up here too.
 - **The Settings tab** shows every setting, its current value and where it
   comes from (default, `docker-compose.yml`, or changed here). You can change
   the day-to-day ones right there. Before saving, LDS tests the change and
@@ -352,14 +381,18 @@ Containers with `traefik.enable=false` are ignored too.
 LDS doesn't get the Docker socket directly, because that would give it full
 control over Docker, and so over the whole machine. (A `:ro` on a socket
 mount doesn't change that.) Instead, `lds-docker-proxy` only lets it **read
-the container list and events**, and only from this machine. It's all set up
-in `docker-compose.yml`.
+the container list and events**. The proxy has no network at all: LDS talks
+to it through a socket file that only the two of them share, so nothing else
+on the machine or the network can reach it. It's all set up in
+`docker-compose.yml`.
 
 ### Things to know
 
 - Docker records can't be removed with `rm` or from the web page. Stop the
   container or change its labels instead.
 - If two containers use the same name, the first one alphabetically wins.
+- Docker records count toward the record limit. If they don't fit, none are
+  changed and the top of the web page says so.
 - Changes show up about a second after a container starts or stops, and LDS
   double-checks every minute.
 - Docker changes never restart dnsmasq, so a container stuck in a restart
@@ -403,6 +436,26 @@ Tips:
 
 ---
 
+## Backing up and moving records
+
+`lds export` prints your records as a plain text file, notes included:
+
+```sh
+lds export > records-backup.txt
+```
+
+`lds import` reads that file back, on this server or another one:
+
+```sh
+cp records-backup.txt data/
+lds import /data/records-backup.txt
+```
+
+Records from Docker are left out, because your containers recreate them. Add
+`--all` to include them.
+
+---
+
 ## A second server
 
 One DNS server is a single point of failure: if that machine is down, nothing
@@ -427,8 +480,10 @@ LDS_REPLICA_OF: http://192.168.1.5:5380   # the first server
 
 The second server:
 
-- copies all records from the first one every 30 seconds
-  (`LDS_REPLICA_INTERVAL` changes that),
+- copies the first server's domains and all its records every 30 seconds
+  (`LDS_REPLICA_INTERVAL` changes that), so you don't set `LDS_ZONES` on it,
+- tells you on its web page when it last copied, and if any record couldn't
+  be copied,
 - saves the copy, so it keeps answering even if the first server is down when
   it restarts,
 - refuses changes. Make them on the first server.
@@ -450,12 +505,14 @@ default:
 | Strict checks on every record  | Sneaking extra settings into dnsmasq through a record.                |
 | Changes need real JSON from the same site | Web pages making your browser change records (CSRF).        |
 | Only answers to known addresses | Websites reaching LDS through a fake domain (DNS rebinding).         |
-| Wrong-token lockout            | Guessing the token: 10 wrong tries locks that address out for 5 minutes. |
+| Wrong-token slowdown           | Guessing the token: after 10 wrong tries, that address gets one try per second for 5 minutes. The right token still works, so nobody can lock you out. |
 | Rate limits and a record limit | Flooding LDS with changes.                                            |
 | Changes tested before saving   | A bad record breaking DNS.                                            |
 | Last working config kept       | DNS going down after a restart, whatever happened to the records.     |
-| Docker socket proxy            | A bug in LDS turning into control over Docker.                        |
+| Docker socket proxy            | A bug in LDS turning into control over Docker. The proxy has no network and allows two read-only requests. |
 | Container hardening            | Read-only files, no extra privileges, only the rights dnsmasq needs.  |
+| Change log                     | Not knowing who changed what: every change is written to `docker logs lds`. |
+| Pinned images, automatic checks | Surprise updates. Images are pinned to exact versions, Dependabot proposes updates, and every change to LDS is tested on GitHub against a real Docker setup. |
 | Local networks only            | Your server becoming an open DNS server on the internet.              |
 | DNSSEC checks                  | Forged answers for signed domains.                                    |
 | Rebinding protection           | Outside domains pointing your devices at internal addresses.          |
@@ -478,13 +535,22 @@ the network could see it. Two easy fixes:
 
 ### Good habits
 
+- Use a long random token. The generated one is; for your own, use
+  `openssl rand -hex 32`. The slowdown above only helps against guessing
+  when the token can't be guessed in the first place.
 - Keep the token private, and change it if it leaks. For the generated one,
   delete `./data/admin-token` and run `docker compose restart lds` to get a
   new one. For your own, write a new `lds_token.txt` and run
   `docker compose up -d`.
 - Set `LDS_HTTP_LISTEN` to your LAN IP (like `192.168.1.5:5380`) so the page
   isn't reachable on other networks.
-- Back up `./data/records.json`.
+- Back up the `./data` folder, or run `lds export` now and then.
+- To see who changed what, run `docker logs lds 2>&1 | grep audit:`. Each
+  line has the address that made the change and what it added, removed or
+  set.
+- Keep the `cap_add` list in `docker-compose.yml` as it is. Without `KILL`,
+  LDS can't restart dnsmasq, so wildcard, CNAME and settings changes wait
+  until the container restarts. (The web page warns you if that happens.)
 
 ---
 
@@ -492,9 +558,11 @@ the network could see it. Two easy fixes:
 
 ```
 lds add <name> <value> [-c note]       Add a record
-lds rm <name or id> [...]              Remove one or more records
+lds rm <name or id> [...]              Remove records (a name removes all with that name)
 lds list [--json] [--source manual|docker|replica]
-lds import [--dry-run] <file>          Import from Pi-hole or a hosts file
+lds check <name>                       Show what a name resolves to, and why
+lds import [--dry-run] <file>          Import from Pi-hole, a hosts file or an export
+lds export [--all]                     Print your records as a file "lds import" can read
 lds healthcheck                        Exit 0 if DNS is answering (used by Docker)
 lds serve                              Run the server (the container does this)
 lds version
@@ -529,8 +597,8 @@ visible to other users on the machine and saved in your shell history.
 There are two ways to change settings:
 
 - **The dashboard's Settings tab** for the day-to-day ones: domains, upstream
-  DNS servers, DNSSEC, rebinding protection, cache size, query logging, the
-  record limit, and the Docker IPs. Changes are checked and tested, then work
+  DNS servers, DNSSEC, rebinding protection, cache size, answer lifetime,
+  query logging, the record limit, and the Docker IPs. Changes are checked and tested, then work
   right away. They're saved in `./data/settings.json` and win over
   `docker-compose.yml`. **Use docker-compose.yml value** undoes one.
 - **`docker-compose.yml`** for everything, including the settings that
@@ -567,6 +635,7 @@ for what each one unlocks.
 | `LDS_DNSSEC` ✏️               | `true`           | Check DNSSEC signatures on upstream answers.                          |
 | `LDS_STOP_DNS_REBIND` ✏️      | `true`           | Block upstream answers that point at private IPs (your zones are exempt). |
 | `LDS_CACHE_SIZE` ✏️           | `10000`          | How many answers to remember.                                         |
+| `LDS_LOCAL_TTL` ✏️            | `0`              | Seconds devices may remember your records (up to 86400). `0` means changes are seen right away. |
 | `LDS_LOG_QUERIES` ✏️          | `false`          | Log every lookup. Handy for debugging, noisy otherwise.               |
 | `LDS_RESTART_SPACING_MS`     | `2000`           | Least time between dnsmasq restarts (wildcard and CNAME changes).     |
 | `LDS_REPLICA_INTERVAL`       | `30`             | Seconds between copies on a replica.                                  |
@@ -649,8 +718,8 @@ Add its domain under **Settings → Domains** (or to `LDS_ZONES`).
    `nslookup nas.home.lan <your-server-ip>`.
 2. If that works, your device isn't using LDS yet. Check your router's DHCP
    settings, then reconnect the device.
-3. If it doesn't work, check `lds list`. Is the record there? Does it have a
-   warning?
+3. If it doesn't work, run `lds check nas.home.lan`. It shows which record
+   decides the answer, or that there is none.
 
 **Devices on a VPN or another subnet get no answers.**
 When `LDS_DNS_LISTEN` is empty, LDS only answers networks it's directly
@@ -662,6 +731,16 @@ connected to. Set `LDS_DNS_LISTEN` to the IPs it should answer on.
   `rebind-domain-ok=/corp.example.com/` in a file in `./dnsmasq.d`.
 - If many sites fail at once, check the server's clock. DNSSEC needs the
   correct time.
+
+**The page says "LDS isn't allowed to stop dnsmasq".**
+The container is missing the `KILL` capability, probably because
+`docker-compose.yml` is from an older version. Make sure it has
+`cap_add: [NET_BIND_SERVICE, SETUID, SETGID, KILL]`, then run
+`docker compose up -d`.
+
+**I get "too many wrong tokens".**
+That address sent 10 wrong tokens, so it's limited to one try per second for
+a few minutes. Wait a second and try again with the right token.
 
 **A Docker app doesn't get a name.**
 
@@ -693,7 +772,8 @@ The web page and the CLI both use this small JSON API.
 | -------- | --------------------------- | ------ | ------------------------------------------------ |
 | `GET`    | `/api/records`              | yes    | List all records                                 |
 | `POST`   | `/api/records`              | yes    | Add a record: `{"name": "...", "value": "...", "comment": "..."}` |
-| `DELETE` | `/api/records/{name or id}` | yes    | Remove a record                                  |
+| `DELETE` | `/api/records/{name or id}` | yes    | Remove a record (a name removes all with that name); returns what was removed |
+| `GET`    | `/api/check?name=...`       | yes    | What a name resolves to, and which record decides it |
 | `GET`    | `/api/status`               | yes    | Health of dnsmasq, Docker and replication        |
 | `GET`    | `/api/settings`             | yes    | Every setting, its value and where it comes from |
 | `PUT`    | `/api/settings`             | yes    | Change settings: `{"set": {"zones": ["home.lan"]}, "reset": ["upstreams"], "dry_run": false}` |
@@ -735,6 +815,10 @@ Run the tests (with dnsmasq installed, they also run a real dnsmasq):
 ```sh
 go test ./...
 ```
+
+Every push also runs `.github/workflows/ci.yml` on GitHub: the tests, a
+vulnerability scan, and the real two-container setup from
+`docker-compose.yml` with DNS queries against port 53.
 
 Run it locally on spare ports:
 

@@ -247,7 +247,8 @@ func (s *Store) Add(r Record) (Record, error) {
 		return Record{}, ErrReadOnly
 	}
 	for _, m := range s.manual {
-		if m.Name == r.Name {
+		// One name can hold an IPv4 and an IPv6 address, nothing else.
+		if m.Name == r.Name && !isPair(m.Type, r.Type) {
 			s.mu.Unlock()
 			return Record{}, fmt.Errorf("%w: %s (%s %s)", ErrExists, m.Name, m.Type, m.Value)
 		}
@@ -272,37 +273,51 @@ func (s *Store) Add(r Record) (Record, error) {
 	return r, nil
 }
 
-// Remove deletes a manual record by ID or name.
-func (s *Store) Remove(key string) (Record, error) {
+// isPair reports whether two record types can share a name: one A and one
+// AAAA (dual-stack).
+func isPair(a, b string) bool {
+	return (a == TypeA && b == TypeAAAA) || (a == TypeAAAA && b == TypeA)
+}
+
+// Remove deletes manual records. An ID removes that one record; a name
+// removes every record with that name (the IPv4 and IPv6 address of a
+// dual-stack name).
+func (s *Store) Remove(key string) ([]Record, error) {
 	key = strings.TrimSpace(key)
 	name := names.Normalize(key)
 	s.mu.Lock()
 	if s.opts.ReadOnly {
 		s.mu.Unlock()
-		return Record{}, ErrReadOnly
+		return nil, ErrReadOnly
 	}
-	idx := -1
-	for i, m := range s.manual {
-		if m.ID == key || m.Name == name {
-			idx = i
+	byID := false
+	for _, m := range s.manual {
+		if m.ID == key {
+			byID = true
 			break
 		}
 	}
-	if idx < 0 {
+	var removed, next []Record
+	for _, m := range s.manual {
+		if (byID && m.ID == key) || (!byID && m.Name == name) {
+			removed = append(removed, m)
+		} else {
+			next = append(next, m)
+		}
+	}
+	if len(removed) == 0 {
 		for _, d := range s.docker {
 			if d.ID == key || d.Name == name {
 				s.mu.Unlock()
-				return Record{}, fmt.Errorf("%s comes from Docker container %q; remove or relabel the container instead", d.Name, d.Container)
+				return nil, fmt.Errorf("%s comes from Docker container %q; remove or relabel the container instead", d.Name, d.Container)
 			}
 		}
 		s.mu.Unlock()
-		return Record{}, fmt.Errorf("%w: %s", ErrNotFound, names.CleanText(key, 100))
+		return nil, fmt.Errorf("%w: %s", ErrNotFound, names.CleanText(key, 100))
 	}
-	removed := s.manual[idx]
-	next := append(append([]Record{}, s.manual[:idx]...), s.manual[idx+1:]...)
 	if err := s.commitLocked(next, s.docker); err != nil {
 		s.mu.Unlock()
-		return Record{}, err
+		return nil, err
 	}
 	s.mu.Unlock()
 	s.changed()
@@ -319,14 +334,18 @@ func (s *Store) SetDocker(records []Record) (bool, error) {
 			continue
 		}
 		r.Source = SourceDocker
-		r.ID = "docker:" + r.Name
+		r.ID = "docker:" + strings.ToLower(r.Type) + ":" + r.Name
 		r.Container = names.CleanText(r.Container, 128)
 		r.Comment = ""
 		clean = append(clean, r)
 	}
-	sort.Slice(clean, func(i, j int) bool { return clean[i].Name < clean[j].Name })
+	sortRecords(clean)
 
 	s.mu.Lock()
+	if s.opts.MaxRecords > 0 && len(clean) > s.opts.MaxRecords {
+		s.mu.Unlock()
+		return false, fmt.Errorf("%d names from Docker is over the record limit (%d); the previous set stays in place", len(clean), s.opts.MaxRecords)
+	}
 	if sameRecords(clean, s.docker) {
 		s.mu.Unlock()
 		return false, nil
@@ -334,11 +353,11 @@ func (s *Store) SetDocker(records []Record) (bool, error) {
 	// Keep the first-seen time of records that already existed.
 	seen := map[string]time.Time{}
 	for _, d := range s.docker {
-		seen[d.Name] = d.CreatedAt
+		seen[d.ID] = d.CreatedAt
 	}
 	now := time.Now().UTC().Truncate(time.Second)
 	for i := range clean {
-		if t, ok := seen[clean[i].Name]; ok {
+		if t, ok := seen[clean[i].ID]; ok {
 			clean[i].CreatedAt = t
 		} else {
 			clean[i].CreatedAt = now
@@ -355,37 +374,52 @@ func (s *Store) SetDocker(records []Record) (bool, error) {
 }
 
 // SetReplica replaces every manual record with a copy of the primary's
-// active records (replica mode only).
-func (s *Store) SetReplica(records []Record) (bool, error) {
+// active records (replica mode only). It reports whether anything changed
+// and how many of the primary's records were left out because they are not
+// valid here (for example, outside this server's domains).
+func (s *Store) SetReplica(records []Record) (changed bool, skipped int, err error) {
 	zones := s.Zones()
 	var clean []Record
+	ids := map[string]bool{}
 	for _, r := range records {
-		if check(r, zones) != nil {
+		id := "replica:" + strings.ToLower(r.Type) + ":" + r.Name
+		if check(r, zones) != nil || ids[id] {
+			skipped++
 			continue
 		}
+		ids[id] = true
 		r.Comment = names.CleanText(r.Comment, MaxCommentLength)
 		r.Container = names.CleanText(r.Container, 128)
 		r.Source = SourceReplica
-		r.ID = "replica:" + r.Name
+		r.ID = id
 		clean = append(clean, r)
 	}
-	sort.Slice(clean, func(i, j int) bool { return clean[i].Name < clean[j].Name })
+	sortRecords(clean)
 	s.mu.Lock()
 	if s.opts.MaxRecords > 0 && len(clean) > s.opts.MaxRecords {
 		s.mu.Unlock()
-		return false, ErrFull
+		return false, skipped, ErrFull
 	}
 	if sameRecords(clean, s.manual) {
 		s.mu.Unlock()
-		return false, nil
+		return false, skipped, nil
 	}
 	if err := s.commitLocked(clean, s.docker); err != nil {
 		s.mu.Unlock()
-		return false, err
+		return false, skipped, err
 	}
 	s.mu.Unlock()
 	s.changed()
-	return true, nil
+	return true, skipped, nil
+}
+
+func sortRecords(recs []Record) {
+	sort.Slice(recs, func(i, j int) bool {
+		if recs[i].Name != recs[j].Name {
+			return recs[i].Name < recs[j].Name
+		}
+		return recs[i].Type < recs[j].Type
+	})
 }
 
 func sameRecords(a, b []Record) bool {
@@ -528,6 +562,57 @@ func (s *Store) Preview(zones []string) (active []Record, dropped []string) {
 		}
 	}
 	return active, dropped
+}
+
+// Explain returns the active records that decide the answer for name: the
+// records with that exact name (following aliases), or else the closest
+// wildcard. inZone is false when the name is outside this server's domains
+// and so is passed on to the upstream servers.
+func (s *Store) Explain(name string) (matched []Record, inZone bool) {
+	name = names.Normalize(name)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	active := activeRecords(s.manual, s.docker, s.opts.Zones)
+	inZone = names.InZones(name, s.opts.Zones)
+	cur := name
+	for depth := 0; depth <= MaxCNAMEChain; depth++ {
+		next := ""
+		for _, r := range active {
+			if r.Type == TypeWildcard || r.Name != cur {
+				continue
+			}
+			matched = append(matched, r)
+			if r.Type == TypeCNAME {
+				next = r.Value
+			}
+		}
+		if next == "" {
+			break
+		}
+		cur = next
+	}
+	if len(matched) > 0 && matched[len(matched)-1].Type != TypeCNAME {
+		return matched, inZone
+	}
+	// No exact name (or an alias pointing at nothing): the longest wildcard
+	// covering the name answers.
+	var best *Record
+	for i, r := range active {
+		if r.Type != TypeWildcard {
+			continue
+		}
+		domain := r.Name[2:]
+		if cur != domain && !strings.HasSuffix(cur, "."+domain) {
+			continue
+		}
+		if best == nil || len(r.Name) > len(best.Name) {
+			best = &active[i]
+		}
+	}
+	if best != nil {
+		matched = append(matched, *best)
+	}
+	return matched, inZone
 }
 
 // List returns every record with its state.
