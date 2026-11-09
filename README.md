@@ -1,196 +1,503 @@
-# local-dns-server
+# localdns
 
-`localdns` replaces Pi-hole's "Local DNS" feature with something built for a
-Traefik + Docker home lab:
+Give the apps in your home lab friendly names like `grafana.home.lan`,
+without fiddling with config files.
 
-- **dnsmasq** answers DNS for your local names and forwards everything else
-  to upstream resolvers.
-- **One CLI command** adds a record: `localdns add nas.home.lan 192.168.1.10`.
-- **A web UI** on port 5380 lists every record, grouped by domain.
-- **Docker discovery** reads the `Host(...)` rules in your containers' Traefik
-  labels and creates the matching records automatically as containers start
-  and stop.
+localdns is a small DNS server for your home network. It does the same job as
+Pi-hole's "Local DNS" page, but it's built for a setup where Traefik sends
+traffic to your Docker containers.
 
-It's a single Go binary (no dependencies beyond the standard library) running
-next to dnsmasq in a small Alpine image.
+## What it does
 
-## Quick start
+- **Answers DNS for your own names**, like `nas.home.lan` → `192.168.1.10`.
+- **Passes every other lookup to the internet** (Cloudflare and Quad9 by
+  default), so it can be the only DNS server on your network.
+- **Adds records with one short command**: `localdns add nas.home.lan 192.168.1.10`.
+- **Shows all your records on a web page**, where you can also add and remove
+  them.
+- **Picks up your Docker apps automatically.** If a container has a Traefik
+  rule like ``Host(`grafana.home.lan`)``, that name starts working as soon as
+  the container starts, with nothing to type.
+- **Imports your old Pi-hole records**, so switching over takes a minute.
 
-1. Free up port 53. Stop Pi-hole, and on Ubuntu/Debian hosts that use it,
-   disable systemd-resolved's stub listener:
+Under the hood it uses [dnsmasq](https://thekelleys.org.uk/dnsmasq/doc.html),
+the same DNS engine Pi-hole uses.
 
-   ```sh
-   sudo sed -i 's/^#\?DNSStubListener=.*/DNSStubListener=no/' /etc/systemd/resolved.conf
-   sudo systemctl restart systemd-resolved
-   ```
+---
 
-2. Edit `docker-compose.yml`: set `LOCALDNS_DOCKER_TARGET` to the IP of the
-   machine running Traefik, and adjust `LOCALDNS_UPSTREAMS` if you like.
+## Contents
 
-3. Start it:
+- [Getting started](#getting-started)
+- [Adding records](#adding-records)
+- [The web page](#the-web-page)
+- [Automatic records from Docker](#automatic-records-from-docker)
+- [Moving from Pi-hole](#moving-from-pi-hole)
+- [Command reference](#command-reference)
+- [Settings](#settings)
+- [Good to know](#good-to-know)
+- [Troubleshooting](#troubleshooting)
+- [API](#api)
+- [For developers](#for-developers)
 
-   ```sh
-   docker compose up -d --build
-   ```
+---
 
-4. Add a wildcard so every name under your domain reaches Traefik:
+## Getting started
 
-   ```sh
-   docker exec localdns localdns add '*.home.lan' 192.168.1.5 -c Traefik
-   ```
+You need a Linux machine with Docker and Docker Compose. Usually that's the
+same machine that runs Traefik.
 
-5. Open `http://<host>:5380`, then point your router's DHCP DNS setting (or
-   individual devices) at the host's IP.
+### 1. Free up port 53
 
-For a shorter command on the Docker host:
+DNS uses port 53, and only one program can use it at a time.
+
+- **If Pi-hole is running on this machine, stop it**:
+  `docker stop pihole`. Copy its records first if you want to keep them (see
+  [Moving from Pi-hole](#moving-from-pi-hole)).
+- **On Ubuntu and Debian**, a built-in service called systemd-resolved also
+  sits on port 53. Turn that part of it off:
+
+  ```sh
+  sudo sed -i 's/^#\?DNSStubListener=.*/DNSStubListener=no/' /etc/systemd/resolved.conf
+  sudo systemctl restart systemd-resolved
+  ```
+
+Not sure whether something is using the port? This command shows it:
+
+```sh
+sudo ss -lunp 'sport = :53'
+```
+
+No output means the port is free.
+
+### 2. Set your Traefik IP
+
+Open `docker-compose.yml` and change this line to the IP address of the
+machine running Traefik:
+
+```yaml
+LOCALDNS_DOCKER_TARGET: 192.168.1.5
+```
+
+### 3. Start it
+
+```sh
+docker compose up -d --build
+```
+
+Then open `http://<your-server-ip>:5380` in a browser. You should see an empty
+list of records.
+
+### 4. Add your first record
+
+This one line sends every name under `home.lan` to Traefik:
+
+```sh
+docker exec localdns localdns add '*.home.lan' 192.168.1.5
+```
+
+Typing `docker exec localdns` every time gets old fast, so add this shortcut
+to your `~/.bashrc` or `~/.zshrc`:
 
 ```sh
 alias localdns='docker exec localdns localdns'
 ```
 
-## Records
+From now on, `localdns add ...` is all you need.
 
-The record type comes from what you type, so there's just one `add` command:
+### 5. Point your network at it
 
-| Command                                          | Type     | dnsmasq line                              |
-| ------------------------------------------------ | -------- | ----------------------------------------- |
-| `localdns add '*.home.lan' 192.168.1.5`          | wildcard | `address=/home.lan/192.168.1.5`           |
-| `localdns add nas.home.lan 192.168.1.10`         | A        | `host-record=nas.home.lan,192.168.1.10`   |
-| `localdns add nas.home.lan fd00::10`             | AAAA     | `host-record=nas.home.lan,fd00::10`       |
-| `localdns add files.home.lan nas.home.lan`       | CNAME    | `cname=files.home.lan,nas.home.lan`       |
+Make your devices use localdns as their DNS server. The easiest way is your
+router's settings: look for **DHCP** → **DNS server**, and enter your server's
+IP address. Devices pick up the change the next time they reconnect.
 
-How they interact:
-
-- A wildcard covers the domain itself and every name under it.
-- A specific A/AAAA record always wins over a wildcard, so
-  `nas.home.lan` can point somewhere else than `*.home.lan`.
-- **A CNAME only works when its target is another record defined here** (A,
-  AAAA, CNAME, or a Docker record). That's a dnsmasq rule, and Pi-hole has the
-  same limitation. Names only covered by a wildcard, and outside names like
-  `example.com`, don't count. The CLI and web UI warn you when an alias won't
-  resolve. For Traefik services you usually don't need CNAMEs at all: the
-  wildcard or Docker discovery already sends them to Traefik.
-
-## CLI
-
-```
-localdns add <name> <value> [-c comment]   add a record
-localdns rm <name|id>...                   remove records
-localdns list [--json] [--source manual|docker]
-localdns import [--dry-run] <file>         import from Pi-hole or a hosts file
-```
-
-The client commands call the server's API at `http://127.0.0.1:5380` by
-default. Use `--server http://dns-host:5380` or `LOCALDNS_URL` to manage it from
-another machine, and `--token` or `LOCALDNS_TOKEN` if the server requires one.
-The same binary runs on the host if you build it with `go build ./cmd/localdns`.
-
-`list --json` makes the records easy to use in scripts:
+Test it from any computer:
 
 ```sh
-localdns list --json | jq -r '.[] | select(.source=="docker") | .name'
+nslookup grafana.home.lan <your-server-ip>
 ```
 
-## Docker discovery
+---
 
-With `LOCALDNS_DOCKER_TARGET` set and the Docker socket mounted, localdns
-watches container start/stop events (and re-checks every minute). For every
-running container it reads all `traefik.*.rule` labels and creates an A record
-for each hostname in `Host(...)` or `HostSNI(...)` matchers:
+## Adding records
+
+There's only one command, `add`. You give it a name and what the name should
+point to, and localdns works out the kind of record for you:
+
+| You type                                      | You get    | What it means                                   |
+| --------------------------------------------- | ---------- | ----------------------------------------------- |
+| `localdns add '*.home.lan' 192.168.1.5`       | Wildcard   | `home.lan` and **every** name under it → that IP |
+| `localdns add nas.home.lan 192.168.1.10`      | A record   | This one name → this IP                          |
+| `localdns add nas.home.lan fd00::10`          | AAAA record | Same, for an IPv6 address                       |
+| `localdns add files.home.lan nas.home.lan`    | CNAME      | This name is a nickname for another name        |
+
+In short: an IP gives you a normal record, another name gives you a CNAME,
+and a name starting with `*.` gives you a wildcard.
+
+Put the wildcard in quotes (`'*.home.lan'`). Otherwise your shell may try to
+treat the `*` as a file pattern.
+
+### Add a note
+
+Use `-c` to remember what a record is for. The note shows up in the list and
+on the web page.
+
+```sh
+localdns add nas.home.lan 192.168.1.10 -c "Synology in the closet"
+```
+
+### Remove a record
+
+Use its name or its ID (the ID is shown by `localdns list`):
+
+```sh
+localdns rm nas.home.lan
+```
+
+### See your records
+
+```sh
+localdns list
+```
+
+```
+NAME              TYPE      VALUE         SOURCE          ID                       NOTE
+*.home.lan        WILDCARD  192.168.1.5   manual          3c6633be                 Traefik
+grafana.home.lan  A         192.168.1.5   docker:grafana  docker:grafana.home.lan
+nas.home.lan      A         192.168.1.10  manual          8ed5116e                 Synology in the closet
+```
+
+Add `--source docker` or `--source manual` to see only one kind, or `--json`
+to use the list in a script.
+
+### Which record wins?
+
+- **A specific name beats a wildcard.** With `*.home.lan → 192.168.1.5` and
+  `nas.home.lan → 192.168.1.10`, the NAS gets its own IP and everything else
+  goes to Traefik.
+- **A record you add yourself beats one from Docker** with the same name.
+- **Names must be unique.** To change a record, remove it and add it again.
+
+### A note about CNAMEs
+
+A CNAME only works when the name it points to **is also a record in
+localdns**. That's a rule in dnsmasq, and Pi-hole has the same limit.
+
+- ✅ `files.home.lan` → `nas.home.lan` works, because `nas.home.lan` is a record here.
+- ❌ `files.home.lan` → `example.com` won't resolve.
+- ❌ A CNAME pointing at a name that's only covered by a wildcard won't
+  resolve either.
+
+You don't have to remember this: the CLI and the web page warn you when a
+CNAME won't work. For apps behind Traefik you rarely need CNAMEs anyway,
+because the wildcard or Docker already handles them.
+
+---
+
+## The web page
+
+Open `http://<your-server-ip>:5380`.
+
+- **Records are grouped by domain**, with the start of each name in bold, so
+  long lists stay easy to scan.
+- **Colors show the kind of record:** amber for wildcards, green for A/AAAA,
+  purple for CNAMEs.
+- **Click a name** to open that site in a new tab.
+- **Add a record** with the form at the top. It works the same way as the
+  `add` command.
+- **Remove a record** with the button on its row. Records from Docker show
+  "auto" instead, because they come from your containers.
+- **Filter** by name, IP or container, or show only manual or Docker records.
+- **The top line shows whether things are healthy**: whether DNS is running,
+  when Docker was last checked, and where other lookups are sent.
+
+The page refreshes itself every 10 seconds and follows your system's light or
+dark mode.
+
+---
+
+## Automatic records from Docker
+
+localdns watches your containers. When a container with a Traefik rule
+starts, its names start working. When it stops, they go away.
+
+For example, this container:
 
 ```yaml
-labels:
-  - traefik.http.routers.grafana.rule=Host(`grafana.home.lan`)
-  # -> grafana.home.lan -> LOCALDNS_DOCKER_TARGET
+services:
+  grafana:
+    image: grafana/grafana
+    labels:
+      - traefik.http.routers.grafana.rule=Host(`grafana.home.lan`)
 ```
 
-Per-container labels:
+…gets `grafana.home.lan` → your Traefik IP, with no command needed.
 
-| Label             | Effect                                                                 |
-| ----------------- | ---------------------------------------------------------------------- |
-| `localdns.enable=false` | Skip this container (`traefik.enable=false` is skipped too).     |
-| `localdns.target=IP`    | Use this IP instead of `LOCALDNS_DOCKER_TARGET`.                 |
-| `localdns.hosts=a.lan,b.lan` | Extra hostnames, e.g. for containers Traefik doesn't route. |
+It understands the usual Traefik rules:
 
-Docker records show up in the CLI and web UI marked as Docker records. They
-can't be removed by hand: stop or relabel the container instead. If you add a
-manual record with the same name, the manual one wins and the Docker record is
-shown as overridden. `HostRegexp` rules are ignored, since there's no single
-name to create; cover those with a wildcard.
+- `` Host(`a.home.lan`) ``
+- `` Host(`a.home.lan`) || Host(`b.home.lan`) ``
+- `` Host(`a.home.lan`, `b.home.lan`) `` (Traefik v2 style)
+- `` Host(`a.home.lan`) && PathPrefix(`/api`) `` (the path part is ignored)
+- `` HostSNI(`db.home.lan`) `` for TCP routers
 
-## Migrating from Pi-hole
+`HostRegexp` rules are skipped, because there's no single name to create.
+Cover those with a wildcard.
 
-Copy Pi-hole's local DNS files out of its container or volume, then import
-them while localdns is running. Use `--dry-run` first to see what would be added.
+### Turning it on
+
+Discovery is on when both of these are in `docker-compose.yml` (they are by
+default):
+
+- `LOCALDNS_DOCKER_TARGET` is set to your Traefik IP.
+- The Docker socket is mounted: `/var/run/docker.sock:/var/run/docker.sock:ro`.
+  The `:ro` means read-only: localdns looks at your containers and never
+  changes them.
+
+To turn it off, remove `LOCALDNS_DOCKER_TARGET`.
+
+### Labels you can add
+
+Put these on a container to change how it's handled:
+
+| Label                         | What it does                                                        |
+| ----------------------------- | ------------------------------------------------------------------- |
+| `localdns.enable=false`       | Ignore this container.                                              |
+| `localdns.target=192.168.1.7` | Point this container's names at a different IP.                      |
+| `localdns.hosts=a.lan,b.lan`  | Add extra names, even for containers that don't use Traefik.         |
+
+Containers with `traefik.enable=false` are ignored too.
+
+### Things to know
+
+- Docker records can't be removed with `rm` or from the web page. Stop the
+  container or change its labels instead.
+- If you add a record by hand with the same name, yours wins. The Docker one
+  stays in the list, crossed out.
+- If two containers use the same name, the first one alphabetically wins.
+- Changes show up about a second after a container starts or stops.
+  localdns also double-checks every minute.
+
+---
+
+## Moving from Pi-hole
+
+Copy your records out of Pi-hole, then import them into localdns.
+
+**Pi-hole v6** keeps everything in one file:
 
 ```sh
-# Pi-hole v6: records live in pihole.toml (dns.hosts and dns.cnameRecords)
-docker cp pihole:/etc/pihole/pihole.toml .
-localdns import pihole.toml
-
-# Pi-hole v5: A records in custom.list, CNAMEs in a dnsmasq file
-docker cp pihole:/etc/pihole/custom.list .
-docker cp pihole:/etc/dnsmasq.d/05-pihole-custom-cname.conf .
-localdns import custom.list
-localdns import 05-pihole-custom-cname.conf
+docker cp pihole:/etc/pihole/pihole.toml ./data/
+localdns import /data/pihole.toml
 ```
 
-`import` also reads plain hosts files and dnsmasq `host-record=`, `cname=` and
-`address=/domain/ip` lines. Records whose name already exists are skipped.
-When you run `docker cp` and `localdns import` inside the container, copy the
-files into the container's `/data` folder (the `./data` folder on the host).
+**Pi-hole v5** uses two files, one for normal records and one for CNAMEs:
 
-## Configuration
+```sh
+docker cp pihole:/etc/pihole/custom.list ./data/
+docker cp pihole:/etc/dnsmasq.d/05-pihole-custom-cname.conf ./data/
+localdns import /data/custom.list
+localdns import /data/05-pihole-custom-cname.conf
+```
 
-All settings are environment variables on the server:
+Why `./data/` and then `/data/`? The `import` command runs inside the
+container, and the `./data` folder on your machine is `/data` inside it.
 
-| Variable                     | Default                         | Meaning                                                     |
-| ---------------------------- | ------------------------------- | ----------------------------------------------------------- |
-| `LOCALDNS_DOCKER_TARGET`     | (unset: discovery off)          | IP that Docker/Traefik hostnames resolve to                 |
-| `DOCKER_HOST`                | `unix:///var/run/docker.sock`   | Docker API (`unix://` or `tcp://`)                          |
-| `LOCALDNS_UPSTREAMS`         | `1.1.1.1,1.0.0.1,9.9.9.9`       | Upstream DNS servers                                        |
-| `LOCALDNS_HTTP_LISTEN`       | `:5380`                         | Web UI and API address                                      |
-| `LOCALDNS_TOKEN`             | (unset)                         | If set, adding/removing records requires this bearer token  |
-| `LOCALDNS_DATA_DIR`          | `/data`                         | Where `records.json` and the generated `dnsmasq.conf` live  |
-| `LOCALDNS_DNS_PORT`          | `53`                            | DNS port                                                    |
-| `LOCALDNS_DNS_LISTEN`        | (all interfaces)                | Comma-separated listen addresses                            |
-| `LOCALDNS_CACHE_SIZE`        | `10000`                         | dnsmasq cache entries                                       |
-| `LOCALDNS_LOG_QUERIES`       | `false`                         | Log every query to the container log                        |
-| `LOCALDNS_DNSMASQ_EXTRA_DIR` | `/etc/dnsmasq.d`                | Extra `*.conf` files included in dnsmasq's config           |
-| `LOCALDNS_DNSMASQ_ENABLED`   | `true`                          | `false` only writes the config (useful for development)     |
+Tips:
 
-Manual records are stored in `/data/records.json`, so keep that volume (and
-back it up). Docker records aren't stored; they're rebuilt from your containers.
+- **Preview first** with `--dry-run`, which shows what would be added without
+  changing anything.
+- **Running it twice is safe.** Names that already exist are skipped.
+- **Imported records get the note "imported"**, so you can spot them later.
+- `import` also reads plain hosts files (`192.168.1.10 nas.lan`) and dnsmasq
+  files with `address=`, `host-record=` and `cname=` lines.
 
-## How it works
+---
 
-- Each change regenerates `dnsmasq.conf`, checks it with `dnsmasq --test`, and
-  restarts dnsmasq. A config that fails the check is never applied. The
-  restart takes a few milliseconds and empties dnsmasq's cache. dnsmasq has to
-  restart because it doesn't reload `address=`, `host-record=` or `cname=` on
-  SIGHUP.
-- If dnsmasq dies, it's restarted within a couple of seconds. `/healthz`
-  returns 503 while it's down, which the image's health check uses.
-- The web UI refreshes every 10 seconds.
+## Command reference
 
-### API
+```
+localdns add <name> <value> [-c note]       Add a record
+localdns rm <name or id> [...]              Remove one or more records
+localdns list [--json] [--source manual|docker]
+localdns import [--dry-run] <file>          Import from Pi-hole or a hosts file
+localdns serve                              Run the server (the container does this)
+localdns version
+localdns help
+```
 
-| Method | Path                        | Body / result                                            |
-| ------ | --------------------------- | -------------------------------------------------------- |
-| GET    | `/api/records`              | `{"records": [...]}`                                     |
-| POST   | `/api/records`              | `{"name", "value", "comment"}` → the new record          |
-| DELETE | `/api/records/{name or id}` | the removed record                                       |
-| GET    | `/api/status`               | dnsmasq and Docker state, upstreams                      |
-| GET    | `/healthz`                  | `ok`, or 503 if dnsmasq isn't running                    |
+### Using the CLI from another computer
 
-## Development
+The CLI talks to the server over the network, so you can use it from your
+laptop too. Build it once (you need [Go](https://go.dev/dl/)):
+
+```sh
+go build -o localdns ./cmd/localdns
+```
+
+Then tell it where the server is:
+
+```sh
+export LOCALDNS_URL=http://192.168.1.5:5380
+localdns list
+```
+
+You can also pass `--server http://192.168.1.5:5380` with each command.
+
+---
+
+## Settings
+
+Set these in the `environment:` section of `docker-compose.yml`, then run
+`docker compose up -d` to apply them.
+
+| Setting                      | Default                       | What it does                                                   |
+| ---------------------------- | ----------------------------- | -------------------------------------------------------------- |
+| `LOCALDNS_DOCKER_TARGET`     | *(empty: Docker discovery off)* | Traefik's IP. Docker names point here.                       |
+| `LOCALDNS_UPSTREAMS`         | `1.1.1.1,1.0.0.1,9.9.9.9`     | Where all other lookups go.                                    |
+| `LOCALDNS_HTTP_LISTEN`       | `:5380`                       | Address and port for the web page and API.                     |
+| `LOCALDNS_TOKEN`             | *(empty)*                     | A password needed to add or remove records. See below.         |
+| `LOCALDNS_DNS_PORT`          | `53`                          | Port for DNS.                                                  |
+| `LOCALDNS_DNS_LISTEN`        | *(all addresses)*             | Only answer on these IPs, comma-separated.                     |
+| `LOCALDNS_CACHE_SIZE`        | `10000`                       | How many answers to remember.                                  |
+| `LOCALDNS_LOG_QUERIES`       | `false`                       | Log every lookup. Handy for debugging, noisy otherwise.        |
+| `LOCALDNS_DATA_DIR`          | `/data`                       | Where records are saved.                                       |
+| `LOCALDNS_DNSMASQ_EXTRA_DIR` | `/etc/dnsmasq.d`              | Folder for your own dnsmasq settings. See below.               |
+| `LOCALDNS_DNSMASQ_ENABLED`   | `true`                        | Set to `false` to only write the config without running dnsmasq. |
+| `DOCKER_HOST`                | `unix:///var/run/docker.sock` | How to reach Docker (`unix://` or `tcp://`).                   |
+
+### Protecting changes with a token
+
+Anyone on your network can open the web page. To stop others from changing
+records, set a token:
+
+```yaml
+LOCALDNS_TOKEN: pick-something-long
+```
+
+- Viewing records still works for everyone.
+- The web page asks for the token the first time you add or remove something,
+  then remembers it in that browser.
+- The CLI reads the token from `LOCALDNS_TOKEN` or `--token`.
+  `docker exec` runs inside the container, which already has the setting, so
+  it works without extra steps.
+
+### Your own dnsmasq settings
+
+Need something extra from dnsmasq, like DHCP or a special forwarding rule? Put
+`.conf` files in the `./dnsmasq.d` folder next to `docker-compose.yml`, then
+restart: `docker compose restart`.
+
+### Your data
+
+Records you add are saved in `./data/records.json`. Back up that file and
+you've backed up everything. Docker records aren't saved, because they're
+rebuilt from your containers each time.
+
+---
+
+## Good to know
+
+- **Changes are instant.** Each change rewrites dnsmasq's settings and
+  restarts it, which takes a few milliseconds.
+- **Mistakes can't break DNS.** Every change is tested before it's used, and a
+  bad one is rejected while the old settings keep working.
+- **It looks after itself.** If dnsmasq crashes, it's restarted within a
+  couple of seconds. The container also has a health check that you can see
+  in `docker ps`.
+- **No ad-blocking.** localdns only does local names and forwarding. If you
+  miss ad-blocking, set `LOCALDNS_UPSTREAMS` to a filtering DNS service such
+  as AdGuard DNS (`94.140.14.14,94.140.15.15`).
+- **Each change clears the cache.** Restarting dnsmasq empties its memory of
+  past answers, so the next few lookups are a little slower. You won't notice
+  it at home-lab sizes.
+
+---
+
+## Troubleshooting
+
+**The web page says dnsmasq stopped, or the logs say "Address in use".**
+Something else is using port 53. Run `sudo ss -lunp 'sport = :53'` to see
+what it is, then go back to [step 1](#1-free-up-port-53).
+
+**A name doesn't work.**
+
+1. Ask localdns directly, so other DNS servers aren't involved:
+   `nslookup nas.home.lan <your-server-ip>`.
+2. If that works, your device isn't using localdns yet. Check your router's
+   DHCP settings, then reconnect the device.
+3. If it doesn't work, check `localdns list`. Is the record there? Does it
+   have a warning?
+
+**A Docker app doesn't get a name.**
+
+- Is `LOCALDNS_DOCKER_TARGET` set? The top of the web page should say "Docker
+  synced".
+- Is the Docker socket mounted in `docker-compose.yml`?
+- Does the container have a `traefik.…rule` label with `Host(...)` in it?
+- Look at the logs: `docker logs localdns`.
+
+**I changed a record, but my computer still gets the old answer.**
+Your computer has its own DNS memory. Wait a minute, or clear it:
+
+- Windows: `ipconfig /flushdns`
+- macOS: `sudo dscacheutil -flushcache; sudo killall -HUP mDNSResponder`
+- Linux: `resolvectl flush-caches`
+
+**I want to see every lookup.**
+Set `LOCALDNS_LOG_QUERIES: "true"`, run `docker compose up -d`, then watch
+`docker logs -f localdns`.
+
+---
+
+## API
+
+The web page and the CLI both use this small JSON API, so you can use it from
+scripts as well.
+
+| Method   | Path                          | What it does                                    |
+| -------- | ----------------------------- | ----------------------------------------------- |
+| `GET`    | `/api/records`                | List all records                                |
+| `POST`   | `/api/records`                | Add a record: `{"name": "...", "value": "...", "comment": "..."}` |
+| `DELETE` | `/api/records/{name or id}`   | Remove a record                                 |
+| `GET`    | `/api/status`                 | Health of dnsmasq and Docker discovery          |
+| `GET`    | `/healthz`                    | `ok`, or an error if DNS is down                |
+
+If you set a token, send it with changes as `Authorization: Bearer <token>`.
+
+```sh
+curl -X POST http://192.168.1.5:5380/api/records \
+  -H 'Content-Type: application/json' \
+  -d '{"name": "nas.home.lan", "value": "192.168.1.10"}'
+```
+
+---
+
+## For developers
+
+localdns is written in Go and uses only the standard library.
+
+```
+cmd/localdns/        the CLI and the serve command, plus the Pi-hole importer
+internal/store/      records: checking, saving, working out types
+internal/dnsmasq/    writes dnsmasq's config and runs dnsmasq
+internal/docker/     reads Traefik labels and follows container events
+internal/server/     the API and the web page (ui/index.html)
+```
+
+Run the tests:
 
 ```sh
 go test ./...
-LOCALDNS_DATA_DIR=./data LOCALDNS_DNS_PORT=5354 LOCALDNS_DNS_LISTEN=127.0.0.1 \
-  go run ./cmd/localdns serve
-dig @127.0.0.1 -p 5354 nas.home.lan
 ```
 
-The tests check generated configs with `dnsmasq --test` when dnsmasq is
-installed.
+When dnsmasq is installed, the tests also check that the generated config is
+valid.
+
+Run it locally on a spare port, without needing root:
+
+```sh
+LOCALDNS_DATA_DIR=./data LOCALDNS_DNS_PORT=5354 LOCALDNS_DNS_LISTEN=127.0.0.1 \
+  go run ./cmd/localdns serve
+
+dig @127.0.0.1 -p 5354 nas.home.lan
+```
