@@ -4,23 +4,60 @@ services:
     image: lds:latest
     container_name: lds
     restart: unless-stopped
-    # Host networking puts dnsmasq on port 53 of every host interface and lets
-    # dnsmasq see real client IPs. Free port 53 first (stop Pi-hole, and
-    # systemd-resolved's stub listener if your distro runs it).
+    # Host networking puts dnsmasq on port 53 of this machine and lets it see
+    # real client IPs. Free port 53 first (stop Pi-hole, and systemd-resolved's
+    # stub listener if your distro runs it).
     network_mode: host
+    depends_on: [docker-proxy]
+
+    # Hardening: read-only filesystem, no privilege escalation, and only the
+    # capabilities dnsmasq needs (bind port 53, then switch to its own user).
+    read_only: true
+    tmpfs: [/tmp]
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE, SETUID, SETGID]
+
     environment:
-      # IP address of the machine running Traefik. Every hostname found in a
-      # container's Traefik rule (Host(`app.home.lan`)) resolves to it.
+      # Required: the domains LDS answers for. Records outside them are refused.
+      LDS_ZONES: home.lan
+      # Required: the access token, read from the secret below.
+      LDS_TOKEN_FILE: /run/secrets/lds_token
+      # IP of the machine running Traefik. Hostnames from your containers'
+      # Traefik rules (Host(`app.home.lan`)) resolve to it.
       LDS_DOCKER_TARGET: 192.168.1.5
+      # Reach Docker through the read-only proxy below, never the raw socket.
+      DOCKER_HOST: tcp://127.0.0.1:2375
+      # Web page and API. Tip: use this machine's LAN IP, e.g. 192.168.1.5:5380.
+      LDS_HTTP_LISTEN: ":5380"
       # Where everything that isn't a local record gets forwarded.
       LDS_UPSTREAMS: 1.1.1.1,1.0.0.1,9.9.9.9
-      # Web UI and API.
-      LDS_HTTP_LISTEN: ":5380"
-      # Uncomment to require a token for changes (CLI reads LDS_TOKEN too).
-      # LDS_TOKEN: change-me
+    secrets: [lds_token]
     volumes:
       - ./data:/data
-      # Optional: your own dnsmasq settings (*.conf), e.g. DHCP.
+      # Optional: your own dnsmasq settings (*.conf).
       - ./dnsmasq.d:/etc/dnsmasq.d:ro
-      # Read-only access for Traefik label discovery.
+
+  # Mounting docker.sock straight into LDS would hand it full control of
+  # Docker (":ro" doesn't limit the API). This proxy only allows reading the
+  # container list and events, and only listens on this machine.
+  docker-proxy:
+    image: tecnativa/docker-socket-proxy:v0.4.1@sha256:3400c429c5f9e1b21d62130fb93b16e2e772d4fb7695bd52fc2b743800b9fe9e
+    container_name: lds-docker-proxy
+    restart: unless-stopped
+    environment:
+      CONTAINERS: 1
+      EVENTS: 1
+      POST: 0
+    ports:
+      - "127.0.0.1:2375:2375"
+    volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
+    read_only: true
+    tmpfs: [/run]
+    security_opt: ["no-new-privileges:true"]
+
+secrets:
+  lds_token:
+    # Create it with: openssl rand -hex 32 > lds_token.txt && chmod 600 lds_token.txt
+    file: ./lds_token.txt

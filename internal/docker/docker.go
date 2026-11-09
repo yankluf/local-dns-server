@@ -5,14 +5,18 @@ package docker
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"net/http"
-	"net/netip"
 	"net/url"
+	"os"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
@@ -20,13 +24,14 @@ import (
 	"time"
 
 	"github.com/yankluf/local-dns-server/internal/config"
+	"github.com/yankluf/local-dns-server/internal/names"
 	"github.com/yankluf/local-dns-server/internal/store"
 )
 
 // Labels that control discovery on a container.
 const (
 	LabelEnable = "lds.enable" // "false" skips the container
-	LabelTarget = "lds.target" // overrides the IP for this container's hosts
+	LabelTarget = "lds.target" // overrides the IP; must be in LDS_DOCKER_ALLOWED_TARGETS
 	LabelHosts  = "lds.hosts"  // extra comma-separated hostnames
 )
 
@@ -53,9 +58,6 @@ type Watcher struct {
 // NewWatcher builds a watcher that talks to cfg.Host.
 func NewWatcher(cfg config.Docker, st *store.Store) (*Watcher, error) {
 	w := &Watcher{cfg: cfg, store: st, status: Status{Enabled: cfg.Enabled, Target: cfg.Target}}
-	if _, err := netip.ParseAddr(cfg.Target); err != nil {
-		return nil, fmt.Errorf("LDS_DOCKER_TARGET must be an IP address: %w", err)
-	}
 	u, err := url.Parse(cfg.Host)
 	if err != nil {
 		return nil, fmt.Errorf("DOCKER_HOST: %w", err)
@@ -69,13 +71,46 @@ func NewWatcher(cfg config.Docker, st *store.Store) (*Watcher, error) {
 				return (&net.Dialer{}).DialContext(ctx, "unix", sock)
 			},
 		}}
-	case "tcp", "http":
+	case "tcp", "http", "https":
+		if cfg.TLSVerify || u.Scheme == "https" {
+			tlsCfg, err := dockerTLS(cfg.CertPath)
+			if err != nil {
+				return nil, err
+			}
+			w.base = "https://" + u.Host
+			w.client = &http.Client{Transport: &http.Transport{TLSClientConfig: tlsCfg}}
+			break
+		}
+		if !config.IsLoopback(u.Host) && !cfg.AllowInsecure {
+			return nil, fmt.Errorf("DOCKER_HOST %s is unencrypted and not on this machine; "+
+				"set DOCKER_TLS_VERIFY=1 and DOCKER_CERT_PATH, or LDS_DOCKER_ALLOW_INSECURE=true on a trusted network", cfg.Host)
+		}
 		w.base = "http://" + u.Host
 		w.client = &http.Client{}
 	default:
 		return nil, fmt.Errorf("DOCKER_HOST scheme %q is not supported (use unix:// or tcp://)", u.Scheme)
 	}
 	return w, nil
+}
+
+// dockerTLS loads ca.pem, cert.pem and key.pem from dir, like the docker CLI.
+func dockerTLS(dir string) (*tls.Config, error) {
+	if dir == "" {
+		return nil, errors.New("DOCKER_TLS_VERIFY needs DOCKER_CERT_PATH (a folder with ca.pem, cert.pem, key.pem)")
+	}
+	ca, err := os.ReadFile(filepath.Join(dir, "ca.pem"))
+	if err != nil {
+		return nil, err
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(ca) {
+		return nil, errors.New("DOCKER_CERT_PATH/ca.pem has no certificates")
+	}
+	cert, err := tls.LoadX509KeyPair(filepath.Join(dir, "cert.pem"), filepath.Join(dir, "key.pem"))
+	if err != nil {
+		return nil, err
+	}
+	return &tls.Config{RootCAs: pool, Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12}, nil
 }
 
 // Status returns the watcher state.
@@ -124,7 +159,13 @@ func (w *Watcher) sync(ctx context.Context) {
 		w.setStatus(func(s *Status) { s.LastError = err.Error(); s.Connected = false })
 		return
 	}
-	if w.store.SetDocker(records) {
+	changed, err := w.store.SetDocker(records)
+	if err != nil {
+		log.Printf("docker sync: keeping the previous Docker records: %v", err)
+		w.setStatus(func(s *Status) { s.LastError = err.Error(); s.Connected = true })
+		return
+	}
+	if changed {
 		log.Printf("docker sync: %d record(s)", len(records))
 	}
 	w.setStatus(func(s *Status) { s.LastSync = time.Now().UTC(); s.LastError = ""; s.Connected = true })
@@ -149,28 +190,40 @@ func (w *Watcher) discover(ctx context.Context) ([]store.Record, error) {
 		return nil, fmt.Errorf("list containers: %s: %s", resp.Status, strings.TrimSpace(string(body)))
 	}
 	var containers []Container
-	if err := json.NewDecoder(resp.Body).Decode(&containers); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 64<<20)).Decode(&containers); err != nil {
 		return nil, fmt.Errorf("list containers: %w", err)
 	}
-	return RecordsFromContainers(containers, w.cfg.Target), nil
+	return RecordsFromContainers(containers, w.cfg), nil
 }
 
-// RecordsFromContainers turns container labels into DNS records. When two
-// containers claim the same hostname, the first one (by container name) wins.
-func RecordsFromContainers(containers []Container, defaultTarget string) []store.Record {
+// RecordsFromContainers turns container labels into DNS records. Only plain
+// hostnames inside the configured zones become records (never wildcards),
+// and lds.target is honored only for IPs listed in LDS_DOCKER_ALLOWED_TARGETS.
+// When two containers claim the same hostname, the first one (by container
+// name) wins.
+func RecordsFromContainers(containers []Container, cfg config.Docker) []store.Record {
 	sort.Slice(containers, func(i, j int) bool { return name(containers[i]) < name(containers[j]) })
+	allowed := map[string]bool{}
+	for _, t := range cfg.AllowedTargets {
+		allowed[t] = true
+	}
 	seen := map[string]bool{}
 	var out []store.Record
 	for _, c := range containers {
+		cname := name(c)
 		if strings.EqualFold(c.Labels[LabelEnable], "false") || strings.EqualFold(c.Labels["traefik.enable"], "false") {
 			continue
 		}
-		target := defaultTarget
+		target := cfg.Target
 		if t := strings.TrimSpace(c.Labels[LabelTarget]); t != "" {
-			if _, err := netip.ParseAddr(t); err == nil {
-				target = t
-			} else {
-				log.Printf("docker: container %s: ignoring invalid %s=%q", name(c), LabelTarget, t)
+			ip, err := names.ParseIP(t)
+			switch {
+			case err != nil:
+				log.Printf("docker: container %s: ignoring invalid %s", cname, LabelTarget)
+			case !allowed[ip.String()]:
+				log.Printf("docker: container %s: ignoring %s=%s (not in LDS_DOCKER_ALLOWED_TARGETS)", cname, LabelTarget, ip)
+			default:
+				target = ip.String()
 			}
 		}
 		var hosts []string
@@ -186,16 +239,23 @@ func RecordsFromContainers(containers []Container, defaultTarget string) []store
 		}
 		sort.Strings(hosts)
 		for _, h := range hosts {
-			r, err := store.New(h, target, "")
+			if strings.Contains(h, "*") {
+				log.Printf("docker: container %s: skipping wildcard %q (add wildcards by hand)", cname, names.CleanText(h, 100))
+				continue
+			}
+			r, err := store.New(h, target, "", cfg.Zones)
 			if err != nil {
-				log.Printf("docker: container %s: skipping %q: %v", name(c), h, err)
+				log.Printf("docker: container %s: skipping %q: %v", cname, names.CleanText(h, 100), err)
+				continue
+			}
+			if r.Type != store.TypeA && r.Type != store.TypeAAAA {
 				continue
 			}
 			if seen[r.Name] {
 				continue
 			}
 			seen[r.Name] = true
-			r.Container = name(c)
+			r.Container = cname
 			out = append(out, r)
 		}
 	}
@@ -203,13 +263,13 @@ func RecordsFromContainers(containers []Container, defaultTarget string) []store
 }
 
 func name(c Container) string {
+	n := c.ID
 	if len(c.Names) > 0 {
-		return strings.TrimPrefix(c.Names[0], "/")
+		n = strings.TrimPrefix(c.Names[0], "/")
+	} else if len(n) > 12 {
+		n = n[:12]
 	}
-	if len(c.ID) > 12 {
-		return c.ID[:12]
-	}
-	return c.ID
+	return names.CleanText(n, 128)
 }
 
 var (

@@ -59,8 +59,9 @@ func TestWatcherFollowsContainers(t *testing.T) {
 	go srv.Serve(ln)
 	defer srv.Close()
 
-	st, _ := store.Open(filepath.Join(dir, "records.json"))
-	w, err := NewWatcher(config.Docker{Enabled: true, Host: "unix://" + sock, Target: "192.168.1.5"}, st)
+	zones := []string{"home.lan"}
+	st, _ := store.Open(filepath.Join(dir, "records.json"), store.Options{Zones: zones})
+	w, err := NewWatcher(config.Docker{Enabled: true, Host: "unix://" + sock, Target: "192.168.1.5", AllowedTargets: []string{"192.168.1.5"}, Zones: zones}, st)
 	if err != nil {
 		t.Fatal(err)
 	}

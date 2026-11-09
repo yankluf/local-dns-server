@@ -4,11 +4,13 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -22,6 +24,8 @@ import (
 	"github.com/yankluf/local-dns-server/internal/config"
 	"github.com/yankluf/local-dns-server/internal/dnsmasq"
 	"github.com/yankluf/local-dns-server/internal/docker"
+	"github.com/yankluf/local-dns-server/internal/names"
+	"github.com/yankluf/local-dns-server/internal/replica"
 	"github.com/yankluf/local-dns-server/internal/server"
 	"github.com/yankluf/local-dns-server/internal/store"
 )
@@ -34,8 +38,9 @@ Usage:
   lds serve                         Run the DNS server and web UI
   lds add <name> <value> [-c text]  Add a record
   lds rm <name|id>                  Remove a record
-  lds list [--json] [--source s]    List records (s: manual or docker)
+  lds list [--json] [--source s]    List records (s: manual, docker or replica)
   lds import <file>                 Import records from Pi-hole or a hosts file
+  lds healthcheck                   Exit 0 if the local server answers DNS (for Docker)
   lds version
 
 The record type comes from the name and value:
@@ -44,7 +49,7 @@ The record type comes from the name and value:
   lds add grafana.home.lan nas.home.lan     CNAME to another local record
 
 Client commands talk to the server at --server, $LDS_URL or
-http://127.0.0.1:5380, sending $LDS_TOKEN if the server requires one.
+http://127.0.0.1:5380. The token comes from $LDS_TOKEN or --token-file.
 `
 
 func main() {
@@ -66,12 +71,14 @@ func main() {
 		err = list(args)
 	case "import":
 		err = importFile(args)
+	case "healthcheck":
+		err = healthcheck()
 	case "version", "--version":
 		fmt.Println(version)
 	case "help", "-h", "--help":
 		fmt.Print(usage)
 	default:
-		fmt.Fprintf(os.Stderr, "unknown command %q\n\n%s", cmd, usage)
+		fmt.Fprintf(os.Stderr, "unknown command %q\n\n%s", names.CleanText(cmd, 50), usage)
 		os.Exit(2)
 	}
 	if err != nil {
@@ -84,16 +91,36 @@ func serve() error {
 	log.SetFlags(log.LstdFlags)
 	cfg, err := config.FromEnv()
 	if err != nil {
-		return err
+		return fmt.Errorf("bad settings:\n%w", err)
 	}
-	st, err := store.Open(filepath.Join(cfg.DataDir, "records.json"))
+	if cfg.InsecureNoAuth && cfg.Token == "" {
+		log.Print("WARNING: LDS_INSECURE_NO_AUTH is on: anyone who can reach the API can change your DNS")
+	}
+	if cfg.Token != "" && cfg.TLSCert == "" && !config.IsLoopback(cfg.HTTPListen) {
+		log.Print("note: the API uses plain HTTP, so the token crosses the network unencrypted; " +
+			"set LDS_TLS_CERT/LDS_TLS_KEY or put LDS behind Traefik with HTTPS")
+	}
+
+	mgr := dnsmasq.NewManager(cfg.DNSmasq)
+	render := func(recs []store.Record) dnsmasq.Files {
+		f, skipped := dnsmasq.Render(cfg.DNSmasq, recs)
+		for _, e := range skipped {
+			log.Print(e)
+		}
+		return f
+	}
+	st, err := store.Open(filepath.Join(cfg.DataDir, "records.json"), store.Options{
+		Zones:      cfg.Zones,
+		MaxRecords: cfg.MaxRecords,
+		ReadOnly:   cfg.ReplicaOf != "",
+		// Every change is tried against dnsmasq before it's saved.
+		Validate: func(active []store.Record) error { return mgr.Validate(render(active)) },
+	})
 	if err != nil {
 		return err
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-
-	mgr := dnsmasq.NewManager(cfg.DNSmasq)
 
 	// Rewrite the dnsmasq config whenever records change, coalescing bursts.
 	changed := make(chan struct{}, 1)
@@ -104,7 +131,7 @@ func serve() error {
 		}
 	})
 	apply := func() {
-		if err := mgr.Apply(dnsmasq.Render(cfg.DNSmasq, st.Active())); err != nil {
+		if err := mgr.Apply(render(st.Active())); err != nil {
 			log.Printf("apply config: %v", err)
 		}
 	}
@@ -118,12 +145,23 @@ func serve() error {
 	} else {
 		log.Print("docker discovery off (set LDS_DOCKER_TARGET to enable)")
 	}
+	var follower *replica.Follower
+	if cfg.ReplicaOf != "" {
+		follower = replica.New(cfg.ReplicaOf, cfg.Token, st, cfg.ReplicaEvery)
+		log.Printf("read-only replica of %s", cfg.ReplicaOf)
+		if strings.HasPrefix(cfg.ReplicaOf, "http://") {
+			log.Print("note: the replica sends the token to the primary over plain HTTP; use https:// for the primary if the network isn't trusted")
+		}
+	}
 
-	apply()
+	mgr.Start(render(st.Active()), render(nil))
 	mgrDone := make(chan struct{})
 	go func() { mgr.Run(ctx); close(mgrDone) }()
 	if watcher != nil {
 		go watcher.Run(ctx)
+	}
+	if follower != nil {
+		go follower.Run(ctx)
 	}
 	go func() {
 		for {
@@ -141,36 +179,106 @@ func serve() error {
 		}
 	}()
 
-	srv := &server.Server{Store: st, DNSmasq: mgr, Docker: watcher, Upstreams: cfg.DNSmasq.Upstreams, Token: cfg.Token}
-	httpSrv := &http.Server{Addr: cfg.HTTPListen, Handler: srv.Handler(), ReadHeaderTimeout: 10 * time.Second}
+	srv := &server.Server{
+		Store: st, DNSmasq: mgr, Docker: watcher, Upstreams: cfg.DNSmasq.Upstreams, Zones: cfg.Zones,
+		Token: cfg.Token, PublicRead: cfg.PublicRead, AllowedHosts: cfg.AllowedHosts,
+		TLS: cfg.TLSCert != "", ReadOnly: cfg.ReplicaOf != "",
+	}
+	if follower != nil {
+		srv.Replica = follower.Status
+	}
+	httpSrv := &http.Server{
+		Addr:              cfg.HTTPListen,
+		Handler:           srv.Handler(),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    16 << 10,
+		TLSConfig:         &tls.Config{MinVersion: tls.VersionTLS12},
+		ErrorLog:          log.New(os.Stderr, "http: ", log.LstdFlags),
+	}
 	go func() {
 		<-ctx.Done()
 		shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		_ = httpSrv.Shutdown(shutdown)
 	}()
-	log.Printf("web UI and API on %s", cfg.HTTPListen)
-	if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		stop()
-		<-mgrDone
-		return err
+	log.Printf("web UI and API on %s (%s), zones: %s", cfg.HTTPListen, map[bool]string{true: "https", false: "http"}[cfg.TLSCert != ""], strings.Join(cfg.Zones, ", "))
+	if cfg.TLSCert != "" {
+		err = httpSrv.ListenAndServeTLS(cfg.TLSCert, cfg.TLSKey)
+	} else {
+		err = httpSrv.ListenAndServe()
 	}
 	stop() // stop dnsmasq too if the HTTP server failed on its own
 	<-mgrDone
+	if err != nil && !errors.Is(err, http.ErrServerClosed) {
+		return err
+	}
 	log.Print("stopped")
 	return nil
 }
 
-// clientFlags adds --server and --token to fs and returns a constructor.
+// healthcheck asks the local server's /healthz, which sends a real DNS query
+// to dnsmasq. Used by the Docker HEALTHCHECK.
+func healthcheck() error {
+	listen := os.Getenv("LDS_HTTP_LISTEN")
+	if listen == "" {
+		listen = ":5380"
+	}
+	host, port, err := net.SplitHostPort(listen)
+	if err != nil {
+		return err
+	}
+	if host == "" || host == "0.0.0.0" || host == "::" {
+		host = "127.0.0.1"
+	}
+	scheme := "http"
+	if os.Getenv("LDS_TLS_CERT") != "" {
+		scheme = "https"
+	}
+	c := &http.Client{
+		Timeout: 5 * time.Second,
+		// The health check only cares that our own server answers.
+		Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}, // #nosec G402 -- local health probe, no secrets sent
+	}
+	resp, err := c.Get(scheme + "://" + net.JoinHostPort(host, port) + "/healthz")
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("unhealthy: %s", resp.Status)
+	}
+	return nil
+}
+
+// clientFlags adds --server and --token-file to fs and returns a constructor.
+// There is deliberately no --token flag: command-line arguments are visible
+// to other users in `ps` and end up in shell history.
 func clientFlags(fs *flag.FlagSet) func() *client.Client {
 	def := os.Getenv("LDS_URL")
 	if def == "" {
 		def = "http://127.0.0.1:5380"
 	}
 	srv := fs.String("server", def, "lds server URL")
-	tok := fs.String("token", os.Getenv("LDS_TOKEN"), "API token")
-	return func() *client.Client { return client.New(*srv, *tok) }
+	tokFile := fs.String("token-file", os.Getenv("LDS_TOKEN_FILE"), "file containing the API token")
+	return func() *client.Client {
+		tok := os.Getenv("LDS_TOKEN")
+		if *tokFile != "" {
+			data, err := os.ReadFile(*tokFile)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "error: --token-file:", err)
+				os.Exit(1)
+			}
+			tok = strings.TrimSpace(string(data))
+		}
+		return client.New(*srv, tok)
+	}
 }
+
+// clean makes server-supplied text safe to print in a terminal.
+func clean(s string) string { return names.CleanText(s, 300) }
 
 // parse lets flags appear before or after positional arguments.
 func parse(fs *flag.FlagSet, args []string) ([]string, error) {
@@ -204,9 +312,9 @@ func add(args []string) error {
 	if err != nil {
 		return err
 	}
-	fmt.Printf("added %s %s -> %s (id %s)\n", r.Type, r.Name, r.Value, r.ID)
+	fmt.Printf("added %s %s -> %s (id %s)\n", clean(r.Type), clean(r.Name), clean(r.Value), clean(r.ID))
 	if r.Warning != "" {
-		fmt.Fprintln(os.Stderr, "warning:", r.Warning)
+		fmt.Fprintln(os.Stderr, "warning:", clean(r.Warning))
 	}
 	return nil
 }
@@ -227,7 +335,7 @@ func remove(args []string) error {
 		if err != nil {
 			return err
 		}
-		fmt.Printf("removed %s %s -> %s\n", r.Type, r.Name, r.Value)
+		fmt.Printf("removed %s %s -> %s\n", clean(r.Type), clean(r.Name), clean(r.Value))
 	}
 	return nil
 }
@@ -273,7 +381,7 @@ func list(args []string) error {
 		if r.Warning != "" {
 			note = strings.TrimSpace("! " + r.Warning + " " + note)
 		}
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n", r.Name, r.Type, r.Value, src, r.ID, note)
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n", clean(r.Name), clean(r.Type), clean(r.Value), clean(src), clean(r.ID), clean(note))
 	}
 	return tw.Flush()
 }
@@ -307,17 +415,17 @@ Understands:
 	var added, skipped int
 	for _, p := range pairs {
 		if *dry {
-			fmt.Printf("would add %s -> %s\n", p[0], p[1])
+			fmt.Printf("would add %s -> %s\n", clean(p[0]), clean(p[1]))
 			continue
 		}
 		r, err := c.Add(p[0], p[1], "imported")
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "skip %s -> %s: %v\n", p[0], p[1], err)
+			fmt.Fprintf(os.Stderr, "skip %s -> %s: %v\n", clean(p[0]), clean(p[1]), err)
 			skipped++
 			continue
 		}
 		added++
-		fmt.Printf("added %s %s -> %s\n", r.Type, r.Name, r.Value)
+		fmt.Printf("added %s %s -> %s\n", clean(r.Type), clean(r.Name), clean(r.Value))
 	}
 	if !*dry {
 		fmt.Printf("%d added, %d skipped\n", added, skipped)

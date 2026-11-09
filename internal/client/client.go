@@ -3,14 +3,18 @@ package client
 
 import (
 	"bytes"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"time"
 
+	"github.com/yankluf/local-dns-server/internal/names"
 	"github.com/yankluf/local-dns-server/internal/store"
 )
 
@@ -21,9 +25,27 @@ type Client struct {
 	HTTP    *http.Client
 }
 
-// New returns a client for baseURL.
+// New returns a client for baseURL. Redirects are never followed, so the
+// token can't be forwarded elsewhere. Set LDS_CA_FILE to trust a private CA
+// for https:// servers.
 func New(baseURL, token string) *Client {
-	return &Client{BaseURL: strings.TrimRight(baseURL, "/"), Token: token, HTTP: &http.Client{Timeout: 15 * time.Second}}
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	if ca := os.Getenv("LDS_CA_FILE"); ca != "" {
+		if pem, err := os.ReadFile(ca); err == nil {
+			pool := x509.NewCertPool()
+			pool.AppendCertsFromPEM(pem)
+			transport.TLSClientConfig = &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}
+		}
+	}
+	return &Client{
+		BaseURL: strings.TrimRight(baseURL, "/"),
+		Token:   token,
+		HTTP: &http.Client{
+			Timeout:       15 * time.Second,
+			Transport:     transport,
+			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+		},
+	}
 }
 
 // List returns all records.
@@ -71,7 +93,7 @@ func (c *Client) do(method, path string, in, out any) error {
 		return fmt.Errorf("can't reach lds at %s (is `lds serve` running? set --server or LDS_URL): %w", c.BaseURL, err)
 	}
 	defer resp.Body.Close()
-	data, err := io.ReadAll(resp.Body)
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 32<<20))
 	if err != nil {
 		return err
 	}
@@ -80,9 +102,9 @@ func (c *Client) do(method, path string, in, out any) error {
 			Error string `json:"error"`
 		}
 		if json.Unmarshal(data, &e) == nil && e.Error != "" {
-			return fmt.Errorf("%s", e.Error)
+			return fmt.Errorf("%s", names.CleanText(e.Error, 500))
 		}
-		return fmt.Errorf("%s: %s", resp.Status, strings.TrimSpace(string(data)))
+		return fmt.Errorf("%s: %s", resp.Status, names.CleanText(string(data), 200))
 	}
 	if out != nil {
 		return json.Unmarshal(data, out)
