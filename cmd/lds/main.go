@@ -4,7 +4,9 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/tls"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -27,6 +29,7 @@ import (
 	"github.com/yankluf/local-dns-server/internal/names"
 	"github.com/yankluf/local-dns-server/internal/replica"
 	"github.com/yankluf/local-dns-server/internal/server"
+	"github.com/yankluf/local-dns-server/internal/settings"
 	"github.com/yankluf/local-dns-server/internal/store"
 )
 
@@ -93,6 +96,11 @@ func serve() error {
 	if err != nil {
 		return fmt.Errorf("bad settings:\n%w", err)
 	}
+	if cfg.TokenAuto {
+		if err := ensureToken(&cfg); err != nil {
+			return err
+		}
+	}
 	if cfg.InsecureNoAuth && cfg.Token == "" {
 		log.Print("WARNING: LDS_INSECURE_NO_AUTH is on: anyone who can reach the API can change your DNS")
 	}
@@ -101,17 +109,25 @@ func serve() error {
 			"set LDS_TLS_CERT/LDS_TLS_KEY or put LDS behind Traefik with HTTPS")
 	}
 
-	mgr := dnsmasq.NewManager(cfg.DNSmasq)
-	render := func(recs []store.Record) dnsmasq.Files {
-		f, skipped := dnsmasq.Render(cfg.DNSmasq, recs)
+	// Settings changed from the dashboard override the environment.
+	sm := settings.Load(filepath.Join(cfg.DataDir, "settings.json"), cfg)
+	cur := sm.Current()
+	if len(cur.Zones) == 0 {
+		log.Print("no domains set yet: DNS forwarding works, but records are refused until you add domains under Settings (or LDS_ZONES)")
+	}
+
+	mgr := dnsmasq.NewManager(cur.DNSmasq)
+	renderWith := func(c config.DNSmasq, recs []store.Record) dnsmasq.Files {
+		f, skipped := dnsmasq.Render(c, recs)
 		for _, e := range skipped {
 			log.Print(e)
 		}
 		return f
 	}
+	render := func(recs []store.Record) dnsmasq.Files { return renderWith(sm.Current().DNSmasq, recs) }
 	st, err := store.Open(filepath.Join(cfg.DataDir, "records.json"), store.Options{
-		Zones:      cfg.Zones,
-		MaxRecords: cfg.MaxRecords,
+		Zones:      cur.Zones,
+		MaxRecords: cur.MaxRecords,
 		ReadOnly:   cfg.ReplicaOf != "",
 		// Every change is tried against dnsmasq before it's saved.
 		Validate: func(active []store.Record) error { return mgr.Validate(render(active)) },
@@ -136,15 +152,39 @@ func serve() error {
 		}
 	}
 
-	var watcher *docker.Watcher
-	if cfg.Docker.Enabled {
-		if watcher, err = docker.NewWatcher(cfg.Docker, st); err != nil {
-			return err
+	// The watcher always exists so discovery can be switched on from the
+	// dashboard; it stays idle while no Traefik IP is set.
+	watcher, dockerErr := docker.NewWatcher(cur.Docker, st)
+	if dockerErr != nil {
+		if cur.Docker.Enabled {
+			return dockerErr
 		}
-		log.Printf("docker discovery on (%s), Traefik hosts -> %s", cfg.Docker.Host, cfg.Docker.Target)
+		log.Printf("docker discovery unavailable: %v", dockerErr)
+		watcher = nil
+	} else if cur.Docker.Enabled {
+		log.Printf("docker discovery on (%s), Traefik hosts -> %s", cur.Docker.Host, cur.Docker.Target)
 	} else {
-		log.Print("docker discovery off (set LDS_DOCKER_TARGET to enable)")
+		log.Print("docker discovery off (set the Traefik IP under Settings, or LDS_DOCKER_TARGET)")
 	}
+
+	sm.Records = st
+	sm.Check = func(c config.Config) ([]string, error) {
+		if c.Docker.Enabled && watcher == nil {
+			return nil, fmt.Errorf("can't turn on Docker discovery: %v", dockerErr)
+		}
+		active, _ := st.Preview(c.Zones)
+		if err := mgr.Validate(renderWith(c.DNSmasq, active)); err != nil {
+			return nil, fmt.Errorf("dnsmasq rejected these settings: %w", err)
+		}
+		return nil, nil
+	}
+	sm.Apply = func(c config.Config) {
+		if watcher != nil {
+			watcher.SetConfig(c.Docker)
+		}
+		st.SetRules(c.Zones, c.MaxRecords) // also rewrites the dnsmasq config
+	}
+
 	var follower *replica.Follower
 	if cfg.ReplicaOf != "" {
 		follower = replica.New(cfg.ReplicaOf, cfg.Token, st, cfg.ReplicaEvery)
@@ -180,7 +220,7 @@ func serve() error {
 	}()
 
 	srv := &server.Server{
-		Store: st, DNSmasq: mgr, Docker: watcher, Upstreams: cfg.DNSmasq.Upstreams, Zones: cfg.Zones,
+		Store: st, DNSmasq: mgr, Docker: watcher, Settings: sm,
 		Token: cfg.Token, PublicRead: cfg.PublicRead, AllowedHosts: cfg.AllowedHosts,
 		TLS: cfg.TLSCert != "", ReadOnly: cfg.ReplicaOf != "",
 	}
@@ -204,7 +244,7 @@ func serve() error {
 		defer cancel()
 		_ = httpSrv.Shutdown(shutdown)
 	}()
-	log.Printf("web UI and API on %s (%s), zones: %s", cfg.HTTPListen, map[bool]string{true: "https", false: "http"}[cfg.TLSCert != ""], strings.Join(cfg.Zones, ", "))
+	log.Printf("web UI and API on %s (%s), domains: %s", cfg.HTTPListen, map[bool]string{true: "https", false: "http"}[cfg.TLSCert != ""], strings.Join(cur.Zones, ", "))
 	if cfg.TLSCert != "" {
 		err = httpSrv.ListenAndServeTLS(cfg.TLSCert, cfg.TLSKey)
 	} else {
@@ -216,6 +256,30 @@ func serve() error {
 		return err
 	}
 	log.Print("stopped")
+	return nil
+}
+
+// ensureToken loads the generated token from the data folder, creating it on
+// first start. Used when no LDS_TOKEN or LDS_TOKEN_FILE is given.
+func ensureToken(cfg *config.Config) error {
+	path := filepath.Join(cfg.DataDir, "admin-token")
+	if data, err := os.ReadFile(path); err == nil {
+		if tok := strings.TrimSpace(string(data)); len(tok) >= config.MinTokenLength {
+			cfg.Token = tok
+			log.Printf("no LDS_TOKEN set: using the token saved in %s", path)
+			return nil
+		}
+	}
+	if err := os.MkdirAll(cfg.DataDir, 0o755); err != nil {
+		return err
+	}
+	b := make([]byte, 32)
+	_, _ = rand.Read(b)
+	cfg.Token = hex.EncodeToString(b)
+	if err := store.WriteFileDurable(path, []byte(cfg.Token+"\n"), 0o600); err != nil {
+		return fmt.Errorf("save generated token: %w", err)
+	}
+	log.Printf("no LDS_TOKEN set: generated a token and saved it in %s. Show it with: docker exec lds cat %s", path, path)
 	return nil
 }
 
@@ -265,6 +329,16 @@ func clientFlags(fs *flag.FlagSet) func() *client.Client {
 	tokFile := fs.String("token-file", os.Getenv("LDS_TOKEN_FILE"), "file containing the API token")
 	return func() *client.Client {
 		tok := os.Getenv("LDS_TOKEN")
+		if tok == "" && *tokFile == "" {
+			// Inside the container, use the token lds serve generated.
+			dir := os.Getenv("LDS_DATA_DIR")
+			if dir == "" {
+				dir = "/data"
+			}
+			if data, err := os.ReadFile(filepath.Join(dir, "admin-token")); err == nil {
+				tok = strings.TrimSpace(string(data))
+			}
+		}
 		if *tokFile != "" {
 			data, err := os.ReadFile(*tokFile)
 			if err != nil {

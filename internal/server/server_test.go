@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/yankluf/local-dns-server/internal/config"
+	"github.com/yankluf/local-dns-server/internal/settings"
 	"github.com/yankluf/local-dns-server/internal/store"
 )
 
@@ -14,12 +16,21 @@ const token = "0123456789abcdef0123"
 
 func newServer(t *testing.T, mod func(*Server)) http.Handler {
 	t.Helper()
+	t.Setenv("LDS_TOKEN", token)
+	t.Setenv("LDS_ZONES", "home.lan")
 	zones := []string{"home.lan"}
 	st, err := store.Open(filepath.Join(t.TempDir(), "r.json"), store.Options{Zones: zones})
 	if err != nil {
 		t.Fatal(err)
 	}
-	s := &Server{Store: st, Zones: zones, Token: token}
+	base, err := config.FromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sm := settings.Load(filepath.Join(t.TempDir(), "settings.json"), base)
+	sm.Apply = func(c config.Config) { st.SetRules(c.Zones, c.MaxRecords) }
+	sm.Records = st
+	s := &Server{Store: st, Token: token, Settings: sm}
 	if mod != nil {
 		mod(s)
 	}
@@ -202,5 +213,69 @@ func TestReadOnlyReplica(t *testing.T) {
 	h := newServer(t, func(s *Server) { s.ReadOnly = true })
 	if w := do(h, req{"POST", "/api/records", `{"name":"a.home.lan","value":"1.2.3.4"}`, authJSON(nil)}); w.Code != http.StatusConflict {
 		t.Errorf("replica accepted a change: %d", w.Code)
+	}
+}
+
+func TestSettings(t *testing.T) {
+	h := newServer(t, nil)
+	auth := map[string]string{"Authorization": "Bearer " + token}
+	if w := do(h, req{"GET", "/api/settings", "", nil}); w.Code != http.StatusUnauthorized {
+		t.Errorf("settings readable without token: %d", w.Code)
+	}
+	w := do(h, req{"GET", "/api/settings", "", auth})
+	if w.Code != 200 || !strings.Contains(w.Body.String(), `"zones"`) || strings.Contains(w.Body.String(), token) {
+		t.Fatalf("get: %d %s", w.Code, w.Body)
+	}
+
+	// Add a record, then preview moving to another domain: a warning, no change.
+	do(h, req{"POST", "/api/records", `{"name":"nas.home.lan","value":"10.0.0.10"}`, authJSON(nil)})
+	w = do(h, req{"PUT", "/api/settings", `{"set":{"zones":["lab.example"]},"dry_run":true}`, authJSON(nil)})
+	if w.Code != 200 || !strings.Contains(w.Body.String(), "stop being served") || strings.Contains(w.Body.String(), `"applied": true`) {
+		t.Fatalf("dry run: %d %s", w.Code, w.Body)
+	}
+	if w := do(h, req{"POST", "/api/records", `{"name":"x.lab.example","value":"10.0.0.1"}`, authJSON(nil)}); w.Code != 400 {
+		t.Errorf("dry run changed the zones: %d", w.Code)
+	}
+
+	// Apply it.
+	w = do(h, req{"PUT", "/api/settings", `{"set":{"zones":["home.lan","lab.example"],"upstreams":["9.9.9.9"]}}`, authJSON(nil)})
+	if w.Code != 200 || !strings.Contains(w.Body.String(), `"applied": true`) || !strings.Contains(w.Body.String(), `"dashboard"`) {
+		t.Fatalf("apply: %d %s", w.Code, w.Body)
+	}
+	if w := do(h, req{"POST", "/api/records", `{"name":"x.lab.example","value":"10.0.0.1"}`, authJSON(nil)}); w.Code != http.StatusCreated {
+		t.Errorf("new zone not in effect: %d %s", w.Code, w.Body)
+	}
+
+	// Bad values and read-only settings are refused.
+	for _, body := range []string{
+		`{"set":{"zones":["com"]}}`,
+		`{"set":{"upstreams":["1.1.1.1\nconf-file=/etc/shadow"]}}`,
+		`{"set":{"upstreams":[]}}`,
+		`{"set":{"docker_target":"fe80::1%z"}}`,
+		`{"set":{"cache_size":-1}}`,
+		`{"set":{"token":"x"}}`,
+		`{"set":{"http_listen":":80"}}`,
+		`{"reset":["token"]}`,
+	} {
+		if w := do(h, req{"PUT", "/api/settings", body, authJSON(nil)}); w.Code != http.StatusBadRequest {
+			t.Errorf("%s: got %d %s", body, w.Code, w.Body)
+		}
+	}
+
+	// Reset goes back to the docker-compose value.
+	w = do(h, req{"PUT", "/api/settings", `{"reset":["zones"]}`, authJSON(nil)})
+	if w.Code != 200 {
+		t.Fatalf("reset: %d %s", w.Code, w.Body)
+	}
+	if w := do(h, req{"POST", "/api/records", `{"name":"y.lab.example","value":"10.0.0.2"}`, authJSON(nil)}); w.Code != 400 {
+		t.Errorf("reset didn't restore the zones: %d", w.Code)
+	}
+
+	// Same protections as other changes.
+	if w := do(h, req{"PUT", "/api/settings", `{"set":{"zones":["evil.example"]}}`, map[string]string{"Content-Type": "text/plain", "Authorization": "Bearer " + token}}); w.Code != http.StatusUnsupportedMediaType {
+		t.Errorf("text/plain settings change: %d", w.Code)
+	}
+	if w := do(h, req{"PUT", "/api/settings", `{"set":{"zones":["evil.example"]}}`, authJSON(map[string]string{"Origin": "https://evil.example"})}); w.Code != http.StatusForbidden {
+		t.Errorf("cross-site settings change: %d", w.Code)
 	}
 }

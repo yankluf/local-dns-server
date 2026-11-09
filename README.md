@@ -31,6 +31,7 @@ the same DNS engine Pi-hole uses.
 ## Contents
 
 - [Getting started](#getting-started)
+- [Basic configuration](#basic-configuration)
 - [Adding records](#adding-records)
 - [The web page](#the-web-page)
 - [Automatic records from Docker](#automatic-records-from-docker)
@@ -74,42 +75,38 @@ sudo ss -lunp 'sport = :53'
 
 No output means the port is free.
 
-### 2. Create your access token
-
-Changing records needs a token, a long random password. Create one next to
-`docker-compose.yml`:
-
-```sh
-openssl rand -hex 32 > lds_token.txt
-chmod 600 lds_token.txt
-```
-
-Keep it somewhere safe, like your password manager. You'll need it to sign
-in to the web page.
-
-### 3. Set your domain and Traefik IP
-
-Open `docker-compose.yml` and change these two lines:
-
-```yaml
-LDS_ZONES: home.lan            # the domain (or domains) your names live under
-LDS_DOCKER_TARGET: 192.168.1.5 # the IP of the machine running Traefik
-```
-
-LDS only ever answers for names inside `LDS_ZONES`. That's a safety rule:
-nobody can use it to redirect `google.com` or your bank.
-
-### 4. Start it
+### 2. Start it
 
 ```sh
 docker compose up -d --build
 ```
 
-This starts two containers: `lds` itself, and a small helper called
-`lds-docker-proxy` that lets LDS see your containers without giving it
-control over Docker.
+That's it: no settings are needed to start. This runs two containers: `lds`
+itself, and a small helper called `lds-docker-proxy` that lets LDS see your
+containers without giving it control over Docker.
 
-Open `http://<your-server-ip>:5380` and sign in with the token from step 2.
+### 3. Sign in
+
+LDS made an access token for you on first start. Show it with:
+
+```sh
+docker exec lds cat /data/admin-token
+```
+
+Keep it somewhere safe, like your password manager. Open
+`http://<your-server-ip>:5380` and sign in with it.
+
+### 4. Set your domain and Traefik IP
+
+Open the **Settings** tab and fill in:
+
+- **Domains**: the domain your names live under, like `home.lan`.
+- **Traefik IP**: the IP of the machine running Traefik, like `192.168.1.5`.
+
+Click **Save changes**. They work right away.
+
+LDS only ever answers for names inside your domains. That's a safety rule:
+nobody can use it to redirect `google.com` or your bank.
 
 ### 5. Add your first record
 
@@ -118,6 +115,8 @@ This one line sends every name under `home.lan` to Traefik:
 ```sh
 docker exec lds lds add '*.home.lan' 192.168.1.5
 ```
+
+(Or use the form on the **Records** tab.)
 
 Typing `docker exec lds` every time gets old fast, so add this shortcut to
 your `~/.bashrc` or `~/.zshrc`:
@@ -140,6 +139,56 @@ Test it from any computer:
 ```sh
 nslookup grafana.home.lan <your-server-ip>
 ```
+
+---
+
+## Basic configuration
+
+LDS starts with no configuration at all, and some things work straight away.
+Others need a setting first. This section lists everything that **doesn't**
+work out of the box, why, and how to turn it on.
+
+### What works with zero configuration
+
+- **DNS forwarding.** Every lookup is sent to Cloudflare and Quad9, with
+  DNSSEC checks. Your devices can use LDS as a normal DNS server.
+- **The web page**, on port 5380 of every address of the machine.
+- **An access token**, generated on first start and saved in
+  `./data/admin-token`.
+- **The `lds` command** inside the container, which already knows the token.
+- **Safety features**: all the protections in [Security](#security), the
+  automatic fallback if something goes wrong, and the health check.
+
+### What needs a setting
+
+| Doesn't work yet | Why | How to turn it on |
+| --- | --- | --- |
+| **Adding records** | LDS only answers for domains you choose, so nobody can use it to redirect outside sites. With no domains set, every record is refused. | **Settings → Domains**, or `LDS_ZONES: home.lan` |
+| **Automatic records from Docker** | LDS has to know which IP your Docker app names should point to. | **Settings → Traefik IP**, or `LDS_DOCKER_TARGET: 192.168.1.5` |
+| **Your devices using LDS** | Devices keep using their old DNS server until told otherwise. | Your router's DHCP settings → DNS server = this machine's IP |
+| **Port 53** | If Pi-hole or systemd-resolved already uses it, dnsmasq can't start. The web page then says "dnsmasq stopped". | Free it up, see [step 1](#1-free-up-port-53) |
+| **HTTPS** | The page and API use plain HTTP, so the token crosses your network unencrypted. | `LDS_TLS_CERT` and `LDS_TLS_KEY`, or Traefik, see [Use HTTPS](#use-https-for-the-web-page) |
+| **Opening the page under a name** like `dns.example.org` | To block DNS rebinding attacks, the page only opens under an IP, `localhost`, or a name inside your domains. Other names get "unknown Host". | `LDS_ALLOWED_HOSTS: dns.example.org` |
+| **Devices on a VPN or another subnet** | With no listen address set, LDS only answers networks it's directly connected to, so it can't become an open DNS server on the internet. | `LDS_DNS_LISTEN: 192.168.1.5` (the IPs to answer on) |
+| **Company sites that resolve to private IPs** (split DNS) | Rebinding protection drops outside answers that point at private addresses. | **Settings → Block rebinding** off, or a `rebind-domain-ok=/corp.example.com/` line in `./dnsmasq.d/` |
+| **Containers choosing their own IP** with `lds.target` | Labels can come from any downloaded image, so other IPs must be approved. | **Settings → Other allowed IPs**, or `LDS_DOCKER_ALLOWED_TARGETS` |
+| **A second server** | It has to know where the first one is, and both need the same token. A generated token isn't shared between machines. | `LDS_REPLICA_OF` plus `LDS_TOKEN_FILE` on both, see [A second server](#a-second-server) |
+| **Your own token** (to share, rotate or keep in a password manager) | Without one, LDS uses the generated token. | `LDS_TOKEN_FILE` (see the comments in `docker-compose.yml`) |
+| **Using the CLI from another computer** | The CLI needs to know where the server is and what the token is. | `LDS_URL` and `LDS_TOKEN_FILE`, see [the CLI](#using-the-cli-from-another-computer) |
+| **More than 5000 records** | A limit stops anyone flooding LDS. | **Settings → Record limit**, or `LDS_MAX_RECORDS` |
+| **Ad-blocking** | LDS doesn't block ads. | **Settings → Upstream DNS servers**: use a filtering service like AdGuard DNS (`94.140.14.14, 94.140.15.15`) |
+| **DHCP or other dnsmasq extras** | Not part of LDS. | Add `.conf` files to `./dnsmasq.d/`; for DHCP also add `NET_ADMIN` and `NET_RAW` to `cap_add` |
+
+### Also worth knowing
+
+- **DNSSEC needs the right time.** If the server's clock is far off, most
+  lookups fail. Fix the clock, or turn off **Settings → Check DNSSEC
+  signatures**.
+- **Wildcards are never created automatically.** Add `*.home.lan` yourself,
+  as in [step 5](#5-add-your-first-record).
+- **Settings changed on the dashboard win** over `docker-compose.yml`. Each
+  setting shows where its value comes from, and **Use docker-compose.yml
+  value** undoes a dashboard change.
 
 ---
 
@@ -238,6 +287,11 @@ Open `http://<your-server-ip>:5380` and sign in with your token.
 - **Filter** by name, IP or container, or show only manual or Docker records.
 - **The top line shows whether things are healthy**: whether DNS is running,
   when Docker was last checked, and where other lookups are sent.
+- **The Settings tab** shows every setting, its current value and where it
+  comes from (default, `docker-compose.yml`, or changed here). You can change
+  the day-to-day ones right there. Before saving, LDS tests the change and
+  asks you to confirm anything with side effects, like records that would
+  stop being served. See [Settings](#settings).
 
 The page refreshes itself every 10 seconds and follows your system's light or
 dark mode.
@@ -316,8 +370,8 @@ in `docker-compose.yml`.
 ## Moving from Pi-hole
 
 Copy your records out of Pi-hole, then import them into LDS. Only names
-inside your zones are imported, so set `LDS_ZONES` to cover them first (for
-example `LDS_ZONES=home.lan,lan.example.com`).
+inside your domains are imported, so add them under **Settings → Domains**
+first (for example `home.lan, lan.example.com`).
 
 **Pi-hole v6** keeps everything in one file:
 
@@ -355,7 +409,17 @@ One DNS server is a single point of failure: if that machine is down, nothing
 on your network can look up names. You can run a second LDS that keeps a
 copy of the first one's records.
 
-On the second machine, use the same `docker-compose.yml` and token, and add:
+Both servers need the same token, so use your own instead of the generated
+one. On the first machine, either create `lds_token.txt` as described in
+`docker-compose.yml`, or reuse the generated one:
+
+```sh
+sudo cp data/admin-token lds_token.txt && sudo chown $USER lds_token.txt && chmod 600 lds_token.txt
+```
+
+Turn on `LDS_TOKEN_FILE` and `secrets` in `docker-compose.yml` on **both**
+machines, copy `lds_token.txt` to the second one, and add this on the second
+machine:
 
 ```yaml
 LDS_REPLICA_OF: http://192.168.1.5:5380   # the first server
@@ -414,8 +478,10 @@ the network could see it. Two easy fixes:
 
 ### Good habits
 
-- Keep `lds_token.txt` private (`chmod 600`), and change it if it leaks:
-  write a new one and run `docker compose up -d`.
+- Keep the token private, and change it if it leaks. For the generated one,
+  delete `./data/admin-token` and run `docker compose restart lds` to get a
+  new one. For your own, write a new `lds_token.txt` and run
+  `docker compose up -d`.
 - Set `LDS_HTTP_LISTEN` to your LAN IP (like `192.168.1.5:5380`) so the page
   isn't reachable on other networks.
 - Back up `./data/records.json`.
@@ -460,25 +526,32 @@ visible to other users on the machine and saved in your shell history.
 
 ## Settings
 
-Set these in the `environment:` section of `docker-compose.yml`, then run
-`docker compose up -d`. LDS checks every setting when it starts and stops
-with a clear message if one is wrong.
+There are two ways to change settings:
 
-**Required**
+- **The dashboard's Settings tab** for the day-to-day ones: domains, upstream
+  DNS servers, DNSSEC, rebinding protection, cache size, query logging, the
+  record limit, and the Docker IPs. Changes are checked and tested, then work
+  right away. They're saved in `./data/settings.json` and win over
+  `docker-compose.yml`. **Use docker-compose.yml value** undoes one.
+- **`docker-compose.yml`** for everything, including the settings that
+  protect the server itself (token, addresses, ports, HTTPS, data folder,
+  Docker connection). The Settings tab shows these too, greyed out. After
+  editing, run `docker compose up -d`.
 
-| Setting                    | What it does                                                     |
-| -------------------------- | ---------------------------------------------------------------- |
-| `LDS_ZONES`                | Domains LDS answers for, comma-separated. Example: `home.lan`.   |
-| `LDS_TOKEN_FILE` or `LDS_TOKEN` | The access token (a file is safer). At least 16 characters. |
+LDS checks every setting when it starts and stops with a clear message if one
+is wrong. None are required; see [Basic configuration](#basic-configuration)
+for what each one unlocks.
 
-**Common**
+**Common** (✏️ = can also be changed on the dashboard)
 
 | Setting                      | Default                       | What it does                                                 |
 | ---------------------------- | ----------------------------- | ------------------------------------------------------------ |
-| `LDS_DOCKER_TARGET`          | *(empty: Docker off)*         | Traefik's IP. Docker names point here.                       |
-| `LDS_DOCKER_ALLOWED_TARGETS` | *(empty)*                     | Other IPs containers may choose with `lds.target`.           |
+| `LDS_ZONES` ✏️               | *(empty: records refused)*    | Domains LDS answers for, comma-separated. Example: `home.lan`. |
+| `LDS_TOKEN_FILE` or `LDS_TOKEN` | *(generated)*              | The access token (a file is safer). At least 16 characters.  |
+| `LDS_DOCKER_TARGET` ✏️       | *(empty: Docker off)*         | Traefik's IP. Docker names point here.                       |
+| `LDS_DOCKER_ALLOWED_TARGETS` ✏️ | *(empty)*                  | Other IPs containers may choose with `lds.target`.           |
 | `DOCKER_HOST`                | `unix:///var/run/docker.sock` | How to reach Docker. The compose file uses the proxy.        |
-| `LDS_UPSTREAMS`              | `1.1.1.1,1.0.0.1,9.9.9.9`     | Where other lookups go. `IP` or `IP#port`.                   |
+| `LDS_UPSTREAMS` ✏️           | `1.1.1.1,1.0.0.1,9.9.9.9`     | Where other lookups go. `IP` or `IP#port`.                   |
 | `LDS_HTTP_LISTEN`            | `:5380`                       | Address and port for the web page and API.                   |
 | `LDS_DNS_LISTEN`             | *(all, local networks only)*  | Only answer on these IPs, comma-separated.                   |
 | `LDS_TLS_CERT`, `LDS_TLS_KEY` | *(empty)*                    | Serve the web page and API over HTTPS.                       |
@@ -490,11 +563,11 @@ with a clear message if one is wrong.
 | ---------------------------- | ---------------- | --------------------------------------------------------------------- |
 | `LDS_ALLOWED_HOSTS`          | *(empty)*        | Extra names the web page may be opened under (besides IPs and your zones). |
 | `LDS_PUBLIC_READ`            | `false`          | Let anyone read records without the token.                            |
-| `LDS_MAX_RECORDS`            | `5000`           | Most records you can add.                                             |
-| `LDS_DNSSEC`                 | `true`           | Check DNSSEC signatures on upstream answers.                          |
-| `LDS_STOP_DNS_REBIND`        | `true`           | Block upstream answers that point at private IPs (your zones are exempt). |
-| `LDS_CACHE_SIZE`             | `10000`          | How many answers to remember.                                         |
-| `LDS_LOG_QUERIES`            | `false`          | Log every lookup. Handy for debugging, noisy otherwise.               |
+| `LDS_MAX_RECORDS` ✏️          | `5000`           | Most records you can add.                                             |
+| `LDS_DNSSEC` ✏️               | `true`           | Check DNSSEC signatures on upstream answers.                          |
+| `LDS_STOP_DNS_REBIND` ✏️      | `true`           | Block upstream answers that point at private IPs (your zones are exempt). |
+| `LDS_CACHE_SIZE` ✏️           | `10000`          | How many answers to remember.                                         |
+| `LDS_LOG_QUERIES` ✏️          | `false`          | Log every lookup. Handy for debugging, noisy otherwise.               |
 | `LDS_RESTART_SPACING_MS`     | `2000`           | Least time between dnsmasq restarts (wildcard and CNAME changes).     |
 | `LDS_REPLICA_INTERVAL`       | `30`             | Seconds between copies on a replica.                                  |
 | `LDS_DNS_PORT`               | `53`             | Port for DNS.                                                         |
@@ -515,7 +588,8 @@ you add DHCP, also add `NET_ADMIN` and `NET_RAW` to `cap_add`.
 ### Your data
 
 Records you add are saved in `./data/records.json`, with the previous version
-kept as `records.json.bak`. Back up the folder and you've backed up
+kept as `records.json.bak`. Dashboard settings are in `./data/settings.json`,
+and the generated token in `./data/admin-token`. Back up the folder and you've backed up
 everything. Docker records aren't saved, because they're rebuilt from your
 containers.
 
@@ -546,8 +620,17 @@ containers.
 ## Troubleshooting
 
 **LDS won't start and prints "bad settings".**
-The message says which setting is wrong and how to fix it. The usual ones
-are a missing `LDS_ZONES` or `lds_token.txt`.
+The message says which setting is wrong and how to fix it. A common one is
+`LDS_TOKEN_FILE` pointing at a file that doesn't exist.
+
+**I can't sign in / I lost the token.**
+Show the generated token with `docker exec lds cat /data/admin-token`. If you
+set your own with `LDS_TOKEN_FILE`, it's in that file.
+
+**The Settings tab says my dashboard settings were ignored.**
+`./data/settings.json` couldn't be read or has a value that's no longer
+valid (for example after an upgrade). LDS is running on the
+`docker-compose.yml` values. Save the settings again to fix the file.
 
 **The page says dnsmasq stopped, or the logs say "Address in use".**
 Something else is using port 53. Run `sudo ss -lunp 'sport = :53'` to see
@@ -558,7 +641,7 @@ You opened it under a name LDS doesn't know. Use the server's IP, a name
 inside your zones, or add the name to `LDS_ALLOWED_HOSTS`.
 
 **A record is refused as "outside the domains this server manages".**
-Add its domain to `LDS_ZONES` and run `docker compose up -d`.
+Add its domain under **Settings → Domains** (or to `LDS_ZONES`).
 
 **A name doesn't work.**
 
@@ -582,9 +665,9 @@ connected to. Set `LDS_DNS_LISTEN` to the IPs it should answer on.
 
 **A Docker app doesn't get a name.**
 
-- Is the name inside `LDS_ZONES`?
-- Is `LDS_DOCKER_TARGET` set? The top of the web page should say "Docker
-  synced".
+- Is the name inside your domains (**Settings → Domains**)?
+- Is the Traefik IP set (**Settings → Traefik IP**)? The top of the web page
+  should say "Docker synced".
 - Is `lds-docker-proxy` running? (`docker ps`)
 - Does the container have a `traefik.…rule` label with `Host(...)` in it?
 - Look at the logs: `docker logs lds`.
@@ -612,15 +695,19 @@ The web page and the CLI both use this small JSON API.
 | `POST`   | `/api/records`              | yes    | Add a record: `{"name": "...", "value": "...", "comment": "..."}` |
 | `DELETE` | `/api/records/{name or id}` | yes    | Remove a record                                  |
 | `GET`    | `/api/status`               | yes    | Health of dnsmasq, Docker and replication        |
+| `GET`    | `/api/settings`             | yes    | Every setting, its value and where it comes from |
+| `PUT`    | `/api/settings`             | yes    | Change settings: `{"set": {"zones": ["home.lan"]}, "reset": ["upstreams"], "dry_run": false}` |
 | `GET`    | `/api/info`                 | no     | Whether a token is needed                        |
 | `GET`    | `/healthz`                  | no     | `ok` if DNS answers a test query                 |
 
 - Send the token as `Authorization: Bearer <token>`.
 - Send bodies with `Content-Type: application/json`.
+- With `"dry_run": true`, a settings change is only checked: you get any
+  warnings (like records that would stop being served) and nothing changes.
 
 ```sh
 curl -X POST http://192.168.1.5:5380/api/records \
-  -H "Authorization: Bearer $(cat lds_token.txt)" \
+  -H "Authorization: Bearer $(sudo cat data/admin-token)" \
   -H 'Content-Type: application/json' \
   -d '{"name": "nas.home.lan", "value": "192.168.1.10"}'
 ```
@@ -639,6 +726,7 @@ internal/store/     records: checking, saving, working out types
 internal/dnsmasq/   writes dnsmasq's files and runs dnsmasq
 internal/docker/    reads Traefik labels and follows container events
 internal/replica/   keeps a read-only copy of another server
+internal/settings/  settings changed from the dashboard
 internal/server/    the API and the web page (ui/)
 ```
 
@@ -652,7 +740,7 @@ Run it locally on spare ports:
 
 ```sh
 mkdir -p /tmp/lds && chmod 755 /tmp/lds
-LDS_ZONES=home.lan LDS_TOKEN=dev-token-0123456789 LDS_DATA_DIR=/tmp/lds \
+LDS_DATA_DIR=/tmp/lds \
 LDS_DNS_PORT=5354 LDS_DNS_LISTEN=127.0.0.1 go run ./cmd/lds serve
 
 dig @127.0.0.1 -p 5354 nas.home.lan

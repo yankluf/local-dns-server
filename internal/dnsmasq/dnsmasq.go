@@ -394,7 +394,10 @@ func (m *Manager) Probe(ctx context.Context) error {
 	}}
 	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
-	_, err := r.LookupHost(ctx, "lds-health-check."+m.cfg.Zones[0])
+	// A single-label name: with domain-needed, dnsmasq answers it locally
+	// (NXDOMAIN) without asking upstream, whatever zones are configured. The
+	// trailing dot stops the resolver from adding search domains.
+	_, err := r.LookupHost(ctx, "lds-health-check.")
 	var dnsErr *net.DNSError
 	if err == nil || (errors.As(err, &dnsErr) && dnsErr.IsNotFound) {
 		return nil // an answer, even "no such name", means dnsmasq is serving

@@ -17,7 +17,7 @@
 
   <section class="signin" id="signin" hidden>
     <h2>Sign in</h2>
-    <p>Enter this server's access token (the <b>LDS_TOKEN</b> setting).</p>
+    <p>Enter this server's access token: your <b>LDS_TOKEN</b>, or the one LDS made for you, shown by <b>docker exec lds cat /data/admin-token</b>.</p>
     <form id="signin-form" autocomplete="off">
       <input type="password" name="token" aria-label="Access token" required>
       <button class="primary" type="submit">Sign in</button>
@@ -28,6 +28,27 @@
 
   <div id="app" hidden>
 
+  <nav class="tabs" aria-label="Sections">
+    <button type="button" data-view="records" aria-current="page">Records</button>
+    <button type="button" data-view="settings">Settings</button>
+  </nav>
+
+  <section id="view-settings" hidden>
+    <p class="intro">Changes here are saved on the server and take priority over docker-compose.yml.
+      Every change is tested before it's used. Settings in grey can only be changed in docker-compose.yml.</p>
+    <p class="hint error" id="settings-error" hidden></p>
+    <form id="settings-form" autocomplete="off">
+      <div id="settings-fields"></div>
+      <div class="savebar">
+        <button class="primary" type="submit">Save changes</button>
+        <span class="hint" id="settings-hint" aria-live="polite"></span>
+      </div>
+    </form>
+  </section>
+
+  <div id="view-records">
+  <div class="notice" id="nozones" hidden>No domains are set up yet, so records can't be added.
+    <button type="button" class="link" data-goto="settings">Add your domain in Settings</button></div>
   <p class="hint" id="readonly" hidden>This server is a read-only copy of the primary. Make changes there.</p>
   <form class="add" id="add" autocomplete="off">
     <input class="mono" name="name" placeholder="grafana.home.lan or *.home.lan" aria-label="Name" required>
@@ -48,6 +69,7 @@
   </div>
 
   <div id="records"></div>
+  </div>
   </div>
 </main>
 

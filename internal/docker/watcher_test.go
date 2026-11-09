@@ -101,3 +101,51 @@ func TestWatcherFollowsContainers(t *testing.T) {
 		return len(v) == 1 && v[0].Name == "grafana.home.lan"
 	})
 }
+
+// Discovery switched on and off from the dashboard while running.
+func TestWatcherSetConfig(t *testing.T) {
+	dir := t.TempDir()
+	sock := filepath.Join(dir, "docker.sock")
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Skip("unix sockets unavailable:", err)
+	}
+	fake := &fakeDocker{events: make(chan string, 4), containers: []Container{{
+		Names:  []string{"/app"},
+		Labels: map[string]string{"traefik.http.routers.a.rule": "Host(`app.home.lan`)"},
+	}}}
+	srv := &http.Server{Handler: fake}
+	go srv.Serve(ln)
+	defer srv.Close()
+
+	zones := []string{"home.lan"}
+	st, _ := store.Open(filepath.Join(dir, "records.json"), store.Options{Zones: zones})
+	off := config.Docker{Host: "unix://" + sock, Zones: zones} // no target: discovery off
+	w, err := NewWatcher(off, st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go w.Run(ctx)
+
+	wait := func(desc string, n int) {
+		t.Helper()
+		for end := time.Now().Add(5 * time.Second); time.Now().Before(end); time.Sleep(50 * time.Millisecond) {
+			if len(st.List()) == n {
+				return
+			}
+		}
+		t.Fatalf("timed out waiting for %s: %+v", desc, st.List())
+	}
+	time.Sleep(200 * time.Millisecond)
+	if len(st.List()) != 0 {
+		t.Fatal("discovery ran while off")
+	}
+	on := off
+	on.Target, on.Enabled, on.AllowedTargets = "10.0.0.5", true, []string{"10.0.0.5"}
+	w.SetConfig(on)
+	wait("records after turning on", 1)
+	w.SetConfig(off)
+	wait("records removed after turning off", 0)
+}

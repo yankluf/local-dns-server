@@ -27,6 +27,7 @@ import (
 	"github.com/yankluf/local-dns-server/internal/dnsmasq"
 	"github.com/yankluf/local-dns-server/internal/docker"
 	"github.com/yankluf/local-dns-server/internal/names"
+	"github.com/yankluf/local-dns-server/internal/settings"
 	"github.com/yankluf/local-dns-server/internal/store"
 )
 
@@ -40,11 +41,10 @@ const csp = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 's
 type Server struct {
 	Store        *store.Store
 	DNSmasq      *dnsmasq.Manager
-	Docker       *docker.Watcher // nil when discovery is off
-	Replica      func() any      // nil unless this is a replica
-	Upstreams    []string
-	Zones        []string
-	Token        string // empty only with LDS_INSECURE_NO_AUTH
+	Docker       *docker.Watcher   // nil when discovery is off
+	Replica      func() any        // nil unless this is a replica
+	Settings     *settings.Manager // current config and dashboard changes
+	Token        string            // empty only with LDS_INSECURE_NO_AUTH
 	PublicRead   bool
 	AllowedHosts []string
 	TLS          bool
@@ -67,6 +67,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/records", s.write(s.add))
 	mux.HandleFunc("DELETE /api/records/{key}", s.write(s.remove))
 	mux.HandleFunc("GET /api/status", s.read(s.statusHandler))
+	mux.HandleFunc("GET /api/settings", s.read(s.getSettings))
+	mux.HandleFunc("PUT /api/settings", s.write(s.putSettings))
 	mux.HandleFunc("GET /healthz", s.healthz)
 	ui, _ := fs.Sub(uiFiles, "ui")
 	mux.Handle("GET /", http.FileServerFS(ui))
@@ -118,7 +120,7 @@ func (s *Server) hostAllowed(hostport string) bool {
 	if _, err := netip.ParseAddr(host); err == nil || host == "localhost" {
 		return true
 	}
-	if names.InZones(host, s.Zones) {
+	if names.InZones(host, s.Store.Zones()) {
 		return true
 	}
 	for _, a := range s.AllowedHosts {
@@ -146,7 +148,7 @@ func (s *Server) write(next http.HandlerFunc) http.HandlerFunc {
 			writeError(w, http.StatusForbidden, errors.New("cross-site request refused"))
 			return
 		}
-		if r.Method == http.MethodPost {
+		if r.Method == http.MethodPost || r.Method == http.MethodPut {
 			mt, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
 			if err != nil || mt != "application/json" {
 				writeError(w, http.StatusUnsupportedMediaType, errors.New("send the body as Content-Type: application/json"))
@@ -237,7 +239,7 @@ func (s *Server) add(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, errors.New("body must be one JSON object with name, value and optional comment"))
 		return
 	}
-	rec, err := store.New(in.Name, in.Value, in.Comment, s.Zones)
+	rec, err := store.New(in.Name, in.Value, in.Comment, s.Store.Zones())
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
@@ -281,8 +283,7 @@ func statusFor(err error) int {
 
 func (s *Server) statusHandler(w http.ResponseWriter, r *http.Request) {
 	out := map[string]any{
-		"upstreams": s.Upstreams,
-		"zones":     s.Zones,
+		"zones":     s.Store.Zones(),
 		"docker":    docker.Status{},
 		"read_only": s.ReadOnly,
 	}
@@ -295,7 +296,41 @@ func (s *Server) statusHandler(w http.ResponseWriter, r *http.Request) {
 	if s.Replica != nil {
 		out["replica"] = s.Replica()
 	}
+	if s.Settings != nil {
+		out["upstreams"] = s.Settings.Current().DNSmasq.Upstreams
+		if e := s.Settings.LoadError(); e != "" {
+			out["settings_error"] = e
+		}
+	}
 	writeJSON(w, http.StatusOK, out)
+}
+
+func (s *Server) getSettings(w http.ResponseWriter, r *http.Request) {
+	if s.Settings == nil {
+		writeError(w, http.StatusNotFound, errors.New("settings aren't available"))
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"fields": s.Settings.Fields(), "error": s.Settings.LoadError()})
+}
+
+func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
+	if s.Settings == nil {
+		writeError(w, http.StatusNotFound, errors.New("settings aren't available"))
+		return
+	}
+	var ch settings.Change
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16<<10))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&ch); err != nil || dec.Decode(&struct{}{}) != io.EOF {
+		writeError(w, http.StatusBadRequest, errors.New(`body must be one JSON object: {"set": {...}, "reset": [...], "dry_run": false}`))
+		return
+	}
+	res, err := s.Settings.Update(ch)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
 }
 
 // healthz answers "ok" only if dnsmasq actually answers a DNS query.

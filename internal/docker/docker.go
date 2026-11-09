@@ -46,18 +46,39 @@ type Status struct {
 
 // Watcher syncs Docker records into the store.
 type Watcher struct {
-	cfg    config.Docker
 	store  *store.Store
 	client *http.Client
 	base   string
+	wake   chan struct{}
 
 	mu     sync.Mutex
+	cfg    config.Docker
 	status Status
+}
+
+// SetConfig changes the target IPs and zones (from the dashboard) and
+// triggers a fresh sync. An empty target turns discovery off.
+func (w *Watcher) SetConfig(cfg config.Docker) {
+	w.mu.Lock()
+	cfg.Host, cfg.TLSVerify, cfg.CertPath, cfg.AllowInsecure = w.cfg.Host, w.cfg.TLSVerify, w.cfg.CertPath, w.cfg.AllowInsecure
+	w.cfg = cfg
+	w.status.Enabled, w.status.Target = cfg.Enabled, cfg.Target
+	w.mu.Unlock()
+	select {
+	case w.wake <- struct{}{}:
+	default:
+	}
+}
+
+func (w *Watcher) config() config.Docker {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.cfg
 }
 
 // NewWatcher builds a watcher that talks to cfg.Host.
 func NewWatcher(cfg config.Docker, st *store.Store) (*Watcher, error) {
-	w := &Watcher{cfg: cfg, store: st, status: Status{Enabled: cfg.Enabled, Target: cfg.Target}}
+	w := &Watcher{cfg: cfg, store: st, wake: make(chan struct{}, 1), status: Status{Enabled: cfg.Enabled, Target: cfg.Target}}
 	u, err := url.Parse(cfg.Host)
 	if err != nil {
 		return nil, fmt.Errorf("DOCKER_HOST: %w", err)
@@ -140,6 +161,8 @@ func (w *Watcher) Run(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			return
+		case <-w.wake:
+			w.sync(ctx)
 		case <-events:
 			// Containers often emit several events in a row; wait for them to settle.
 			debounce = time.After(time.Second)
@@ -153,6 +176,13 @@ func (w *Watcher) Run(ctx context.Context) {
 }
 
 func (w *Watcher) sync(ctx context.Context) {
+	if !w.config().Enabled {
+		if changed, _ := w.store.SetDocker(nil); changed {
+			log.Print("docker discovery off: removed Docker records")
+		}
+		w.setStatus(func(s *Status) { s.Connected = false; s.LastError = "" })
+		return
+	}
 	records, err := w.discover(ctx)
 	if err != nil {
 		log.Printf("docker sync: %v", err)
@@ -193,7 +223,7 @@ func (w *Watcher) discover(ctx context.Context) ([]store.Record, error) {
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 64<<20)).Decode(&containers); err != nil {
 		return nil, fmt.Errorf("list containers: %w", err)
 	}
-	return RecordsFromContainers(containers, w.cfg), nil
+	return RecordsFromContainers(containers, w.config()), nil
 }
 
 // RecordsFromContainers turns container labels into DNS records. Only plain
@@ -296,6 +326,14 @@ func HostsFromRule(rule string) []string {
 func (w *Watcher) watchEvents(ctx context.Context, events chan<- struct{}) {
 	filters := url.QueryEscape(`{"type":["container"],"event":["start","die","destroy","rename","update"]}`)
 	for ctx.Err() == nil {
+		if !w.config().Enabled { // discovery off: don't connect, check again soon
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(2 * time.Second):
+			}
+			continue
+		}
 		err := w.streamEvents(ctx, filters, events)
 		if ctx.Err() != nil {
 			return

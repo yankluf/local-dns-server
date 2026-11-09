@@ -27,13 +27,15 @@ type Config struct {
 	HTTPListen     string        // LDS_HTTP_LISTEN
 	DataDir        string        // LDS_DATA_DIR
 	Token          string        // LDS_TOKEN or the contents of LDS_TOKEN_FILE
+	TokenAuto      bool          // no token given: lds serve generates one in the data folder
 	InsecureNoAuth bool          // LDS_INSECURE_NO_AUTH: allow running without a token
 	PublicRead     bool          // LDS_PUBLIC_READ: allow reading records without the token
 	AllowedHosts   []string      // LDS_ALLOWED_HOSTS: extra Host header values accepted by the API
 	TLSCert        string        // LDS_TLS_CERT
 	TLSKey         string        // LDS_TLS_KEY
-	Zones          []string      // LDS_ZONES: the only domains records may use
-	MaxRecords     int           // LDS_MAX_RECORDS
+	Zones          []string      // LDS_ZONES: the only domains records may use (editable)
+	AllowTLDZones  bool          // LDS_ALLOW_TLD_ZONES
+	MaxRecords     int           // LDS_MAX_RECORDS (editable)
 	ReplicaOf      string        // LDS_REPLICA_OF: primary's URL; makes this server a read-only copy
 	ReplicaEvery   time.Duration // LDS_REPLICA_INTERVAL
 
@@ -67,7 +69,8 @@ type Docker struct {
 	CertPath       string   // DOCKER_CERT_PATH
 	AllowInsecure  bool     // LDS_DOCKER_ALLOW_INSECURE: plain tcp:// to a non-loopback host
 	Target         string   // LDS_DOCKER_TARGET: IP that Traefik listens on
-	AllowedTargets []string // LDS_DOCKER_ALLOWED_TARGETS: IPs a container may pick with lds.target
+	ExtraTargets   []string // LDS_DOCKER_ALLOWED_TARGETS: other IPs a container may pick with lds.target
+	AllowedTargets []string // Target plus ExtraTargets
 	Zones          []string // copied from Config.Zones
 }
 
@@ -105,8 +108,7 @@ func FromEnv() (Config, error) {
 	c.PublicRead = b("LDS_PUBLIC_READ", false)
 	switch {
 	case c.Token == "" && !c.InsecureNoAuth:
-		errs = append(errs, errors.New("LDS_TOKEN (or LDS_TOKEN_FILE) is required: anyone who can reach the API could otherwise redirect your DNS. "+
-			"Generate one with `openssl rand -hex 32`. To run without one on a trusted test network, set LDS_INSECURE_NO_AUTH=true"))
+		c.TokenAuto = true // lds serve creates and saves a random token
 	case c.Token != "" && len(c.Token) < MinTokenLength:
 		errs = append(errs, fmt.Errorf("LDS_TOKEN must be at least %d characters", MinTokenLength))
 	}
@@ -120,22 +122,9 @@ func FromEnv() (Config, error) {
 		errs = append(errs, errors.New("set both LDS_TLS_CERT and LDS_TLS_KEY, or neither"))
 	}
 
-	// Zones.
-	for _, z := range envList("LDS_ZONES", "") {
-		z = names.Normalize(z)
-		if err := names.ValidHostname(z); err != nil {
-			errs = append(errs, fmt.Errorf("LDS_ZONES: %w", err))
-			continue
-		}
-		if !strings.Contains(z, ".") && !c.allowTLD() {
-			errs = append(errs, fmt.Errorf("LDS_ZONES: %q is a whole top-level domain; use something like home.%s, or set LDS_ALLOW_TLD_ZONES=true", z, z))
-			continue
-		}
-		c.Zones = append(c.Zones, z)
-	}
-	if len(c.Zones) == 0 {
-		errs = append(errs, errors.New("LDS_ZONES is required: the domains LDS may answer for, e.g. LDS_ZONES=home.lan"))
-	}
+	// Zones (optional at startup: they can be set from the dashboard).
+	c.AllowTLDZones = b("LDS_ALLOW_TLD_ZONES", false)
+	c.Zones = envList("LDS_ZONES", "")
 	c.MaxRecords = i("LDS_MAX_RECORDS", 5000, 1, 1_000_000)
 
 	// Replica.
@@ -145,8 +134,8 @@ func FromEnv() (Config, error) {
 		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 			errs = append(errs, errors.New("LDS_REPLICA_OF must be a URL like https://dns1.home.lan:5380"))
 		}
-		if c.Token == "" {
-			errs = append(errs, errors.New("LDS_REPLICA_OF needs LDS_TOKEN set to the primary's token"))
+		if c.TokenAuto {
+			errs = append(errs, errors.New("LDS_REPLICA_OF needs LDS_TOKEN or LDS_TOKEN_FILE set to the primary's token"))
 		}
 	}
 
@@ -160,7 +149,6 @@ func FromEnv() (Config, error) {
 	d.DNSSEC = b("LDS_DNSSEC", true)
 	d.StopRebind = b("LDS_STOP_DNS_REBIND", true)
 	d.ExtraDir = env("LDS_DNSMASQ_EXTRA_DIR", "/etc/dnsmasq.d")
-	d.Zones = c.Zones
 	d.RestartSpacing = time.Duration(i("LDS_RESTART_SPACING_MS", 2000, 0, 60000)) * time.Millisecond
 	for _, l := range envList("LDS_DNS_LISTEN", "") {
 		if _, err := names.ParseIP(l); err != nil {
@@ -169,16 +157,7 @@ func FromEnv() (Config, error) {
 		}
 		d.Listen = append(d.Listen, l)
 	}
-	for _, u := range envList("LDS_UPSTREAMS", "1.1.1.1,1.0.0.1,9.9.9.9") {
-		if err := validUpstream(u); err != nil {
-			errs = append(errs, fmt.Errorf("LDS_UPSTREAMS: %w", err))
-			continue
-		}
-		d.Upstreams = append(d.Upstreams, u)
-	}
-	if len(d.Upstreams) == 0 {
-		errs = append(errs, errors.New("LDS_UPSTREAMS: at least one upstream DNS server is required"))
-	}
+	d.Upstreams = envList("LDS_UPSTREAMS", "1.1.1.1,1.0.0.1,9.9.9.9")
 	if err := names.SafePath(c.DataDir); err != nil {
 		errs = append(errs, fmt.Errorf("LDS_DATA_DIR: %w", err))
 	}
@@ -197,31 +176,132 @@ func FromEnv() (Config, error) {
 	k.CertPath = os.Getenv("DOCKER_CERT_PATH")
 	k.AllowInsecure = b("LDS_DOCKER_ALLOW_INSECURE", false)
 	k.Target = strings.TrimSpace(os.Getenv("LDS_DOCKER_TARGET"))
-	k.Enabled = k.Target != ""
-	k.Zones = c.Zones
-	if k.Enabled {
-		ip, err := names.ParseIP(k.Target)
-		if err != nil {
-			errs = append(errs, fmt.Errorf("LDS_DOCKER_TARGET: %w", err))
-		}
-		k.Target = ip.String()
-		k.AllowedTargets = []string{k.Target}
-		for _, t := range envList("LDS_DOCKER_ALLOWED_TARGETS", "") {
-			ip, err := names.ParseIP(t)
-			if err != nil {
-				errs = append(errs, fmt.Errorf("LDS_DOCKER_ALLOWED_TARGETS: %w", err))
-				continue
-			}
-			k.AllowedTargets = append(k.AllowedTargets, ip.String())
-		}
-	}
+	k.ExtraTargets = envList("LDS_DOCKER_ALLOWED_TARGETS", "")
 
+	errs = append(errs, c.finish()...)
 	return c, errors.Join(errs...)
 }
 
-func (c Config) allowTLD() bool {
-	v, _ := strconv.ParseBool(os.Getenv("LDS_ALLOW_TLD_ZONES"))
-	return v
+// finish validates and normalizes the settings that can also be changed from
+// the dashboard, and fills in the values derived from them.
+func (c *Config) finish() []error {
+	var errs []error
+	var zones []string
+	for _, z := range c.Zones {
+		z = names.Normalize(z)
+		if err := names.ValidHostname(z); err != nil {
+			errs = append(errs, fmt.Errorf("zones: %w", err))
+			continue
+		}
+		if !strings.Contains(z, ".") && !c.AllowTLDZones {
+			errs = append(errs, fmt.Errorf("zones: %q is a whole top-level domain; use something like home.%s (or set LDS_ALLOW_TLD_ZONES=true)", z, z))
+			continue
+		}
+		dup := false
+		for _, have := range zones {
+			dup = dup || have == z
+		}
+		if !dup {
+			zones = append(zones, z)
+		}
+	}
+	c.Zones = zones
+
+	var ups []string
+	for _, u := range c.DNSmasq.Upstreams {
+		if err := validUpstream(u); err != nil {
+			errs = append(errs, fmt.Errorf("upstreams: %w", err))
+			continue
+		}
+		ups = append(ups, u)
+	}
+	c.DNSmasq.Upstreams = ups
+	if len(ups) == 0 {
+		errs = append(errs, errors.New("upstreams: at least one upstream DNS server is required"))
+	}
+	if c.DNSmasq.CacheSize < 0 || c.DNSmasq.CacheSize > 100000 {
+		errs = append(errs, errors.New("cache size must be from 0 to 100000"))
+	}
+	if c.MaxRecords < 1 || c.MaxRecords > 1_000_000 {
+		errs = append(errs, errors.New("record limit must be from 1 to 1000000"))
+	}
+
+	k := &c.Docker
+	k.Enabled = k.Target != ""
+	k.AllowedTargets = nil
+	if k.Enabled {
+		ip, err := names.ParseIP(k.Target)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("Docker target: %w", err))
+		} else {
+			k.Target = ip.String()
+			k.AllowedTargets = []string{k.Target}
+		}
+	}
+	var extra []string
+	for _, t := range k.ExtraTargets {
+		ip, err := names.ParseIP(t)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("allowed Docker targets: %w", err))
+			continue
+		}
+		extra = append(extra, ip.String())
+		k.AllowedTargets = append(k.AllowedTargets, ip.String())
+	}
+	k.ExtraTargets = extra
+
+	c.DNSmasq.Zones = c.Zones
+	k.Zones = c.Zones
+	return errs
+}
+
+// Overrides are settings changed from the dashboard. A nil field means "use
+// the value from the environment (docker-compose.yml) or the default".
+type Overrides struct {
+	Zones                *[]string `json:"zones,omitempty"`
+	Upstreams            *[]string `json:"upstreams,omitempty"`
+	DockerTarget         *string   `json:"docker_target,omitempty"`
+	DockerAllowedTargets *[]string `json:"docker_allowed_targets,omitempty"`
+	DNSSEC               *bool     `json:"dnssec,omitempty"`
+	StopRebind           *bool     `json:"stop_dns_rebind,omitempty"`
+	CacheSize            *int      `json:"cache_size,omitempty"`
+	LogQueries           *bool     `json:"log_queries,omitempty"`
+	MaxRecords           *int      `json:"max_records,omitempty"`
+}
+
+// WithOverrides returns c with the dashboard overrides applied and validated.
+func (c Config) WithOverrides(o Overrides) (Config, error) {
+	c.Zones = append([]string(nil), c.Zones...)
+	c.DNSmasq.Upstreams = append([]string(nil), c.DNSmasq.Upstreams...)
+	c.Docker.ExtraTargets = append([]string(nil), c.Docker.ExtraTargets...)
+	if o.Zones != nil {
+		c.Zones = append([]string(nil), *o.Zones...)
+	}
+	if o.Upstreams != nil {
+		c.DNSmasq.Upstreams = append([]string(nil), *o.Upstreams...)
+	}
+	if o.DockerTarget != nil {
+		c.Docker.Target = strings.TrimSpace(*o.DockerTarget)
+	}
+	if o.DockerAllowedTargets != nil {
+		c.Docker.ExtraTargets = append([]string(nil), *o.DockerAllowedTargets...)
+	}
+	if o.DNSSEC != nil {
+		c.DNSmasq.DNSSEC = *o.DNSSEC
+	}
+	if o.StopRebind != nil {
+		c.DNSmasq.StopRebind = *o.StopRebind
+	}
+	if o.CacheSize != nil {
+		c.DNSmasq.CacheSize = *o.CacheSize
+	}
+	if o.LogQueries != nil {
+		c.DNSmasq.LogQueries = *o.LogQueries
+	}
+	if o.MaxRecords != nil {
+		c.MaxRecords = *o.MaxRecords
+	}
+	return c, errors.Join(c.finish()...)
 }
 
 // validUpstream accepts "IP" or "IP#port".

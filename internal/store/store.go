@@ -102,9 +102,6 @@ type Store struct {
 // Open loads the store from path. If the file is missing or damaged it falls
 // back to the backup copy kept next to it.
 func Open(path string, opts Options) (*Store, error) {
-	if len(opts.Zones) == 0 {
-		return nil, errors.New("store needs at least one zone")
-	}
 	s := &Store{path: path, opts: opts}
 	recs, err := readRecords(path)
 	if err != nil {
@@ -169,6 +166,9 @@ func New(name, value, comment string, zones []string) (Record, error) {
 	value = strings.TrimSpace(value)
 	r := Record{Name: name, Comment: names.CleanText(comment, MaxCommentLength)}
 	inZones := func(n string) error {
+		if len(zones) == 0 {
+			return errors.New("no domains are set up yet: add yours under Settings → Domains (or LDS_ZONES)")
+		}
 		if !names.InZones(n, zones) {
 			return fmt.Errorf("%s is outside the domains this server manages (%s)", n, strings.Join(zones, ", "))
 		}
@@ -237,7 +237,7 @@ func check(r Record, zones []string) error {
 
 // Add stores a new manual record.
 func (s *Store) Add(r Record) (Record, error) {
-	if err := check(r, s.opts.Zones); err != nil {
+	if err := check(r, s.Zones()); err != nil {
 		return Record{}, fmt.Errorf("%w: %v", ErrInvalid, err)
 	}
 	r.Comment = names.CleanText(r.Comment, MaxCommentLength)
@@ -312,9 +312,10 @@ func (s *Store) Remove(key string) (Record, error) {
 // SetDocker replaces the set of Docker-discovered records. Only A/AAAA
 // records inside the zones are accepted. It reports whether anything changed.
 func (s *Store) SetDocker(records []Record) (bool, error) {
+	zones := s.Zones()
 	var clean []Record
 	for _, r := range records {
-		if (r.Type != TypeA && r.Type != TypeAAAA) || check(r, s.opts.Zones) != nil {
+		if (r.Type != TypeA && r.Type != TypeAAAA) || check(r, zones) != nil {
 			continue
 		}
 		r.Source = SourceDocker
@@ -356,9 +357,10 @@ func (s *Store) SetDocker(records []Record) (bool, error) {
 // SetReplica replaces every manual record with a copy of the primary's
 // active records (replica mode only).
 func (s *Store) SetReplica(records []Record) (bool, error) {
+	zones := s.Zones()
 	var clean []Record
 	for _, r := range records {
-		if check(r, s.opts.Zones) != nil {
+		if check(r, zones) != nil {
 			continue
 		}
 		r.Comment = names.CleanText(r.Comment, MaxCommentLength)
@@ -368,10 +370,11 @@ func (s *Store) SetReplica(records []Record) (bool, error) {
 		clean = append(clean, r)
 	}
 	sort.Slice(clean, func(i, j int) bool { return clean[i].Name < clean[j].Name })
+	s.mu.Lock()
 	if s.opts.MaxRecords > 0 && len(clean) > s.opts.MaxRecords {
+		s.mu.Unlock()
 		return false, ErrFull
 	}
-	s.mu.Lock()
 	if sameRecords(clean, s.manual) {
 		s.mu.Unlock()
 		return false, nil
@@ -493,6 +496,38 @@ func loopMembers(recs []Record) map[string]bool {
 		}
 	}
 	return bad
+}
+
+// SetRules changes the zones and record limit (from the dashboard). Records
+// outside the new zones stay saved but are no longer served.
+func (s *Store) SetRules(zones []string, maxRecords int) {
+	s.mu.Lock()
+	s.opts.Zones = append([]string(nil), zones...)
+	s.opts.MaxRecords = maxRecords
+	s.mu.Unlock()
+	s.changed()
+}
+
+// Zones returns the current zones.
+func (s *Store) Zones() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.opts.Zones...)
+}
+
+// Preview returns the records that would be served under other zones, and
+// the manual records that would stop being served.
+func (s *Store) Preview(zones []string) (active []Record, dropped []string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, v := range views(s.manual, s.docker, zones) {
+		if v.Active {
+			active = append(active, v.Record)
+		} else if v.Source != SourceDocker && check(v.Record, s.opts.Zones) == nil {
+			dropped = append(dropped, v.Name)
+		}
+	}
+	return active, dropped
 }
 
 // List returns every record with its state.
