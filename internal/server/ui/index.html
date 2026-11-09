@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LDS</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230f7c6e'/%3E%3Cpath d='M9 9v14h5M18 9h3a5 5 0 0 1 0 10h-3z' fill='none' stroke='white' stroke-width='3'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<main>
+  <header>
+    <h1>LDS <span>Local DNS Server</span></h1>
+    <ul class="status" id="status" aria-live="polite"><li>Connecting…</li></ul>
+    <button type="button" class="signout" id="signout" hidden>Sign out</button>
+  </header>
+
+  <section class="signin" id="signin" hidden>
+    <h2>Sign in</h2>
+    <p>Enter this server's access token: your <b>LDS_TOKEN</b>, or the one LDS made for you, shown by <b>docker exec lds cat /data/admin-token</b>.</p>
+    <form id="signin-form" autocomplete="off">
+      <input type="password" name="token" aria-label="Access token" required>
+      <button class="primary" type="submit">Sign in</button>
+      <label><input type="checkbox" name="remember"> Remember on this browser</label>
+    </form>
+    <p class="hint error" id="signin-error"></p>
+  </section>
+
+  <div id="app" hidden>
+
+  <nav class="tabs" aria-label="Sections">
+    <button type="button" data-view="records" aria-current="page">Records</button>
+    <button type="button" data-view="settings">Settings</button>
+  </nav>
+
+  <section id="view-settings" hidden>
+    <p class="intro">Changes here are saved on the server and take priority over docker-compose.yml.
+      Every change is tested before it's used. Settings in grey can only be changed in docker-compose.yml.</p>
+    <p class="hint error" id="settings-error" hidden></p>
+    <form id="settings-form" autocomplete="off">
+      <div id="settings-fields"></div>
+      <div class="savebar">
+        <button class="primary" type="submit">Save changes</button>
+        <span class="hint" id="settings-hint" aria-live="polite"></span>
+      </div>
+    </form>
+  </section>
+
+  <div id="view-records">
+  <div class="notice" id="nozones" hidden>No domains are set up yet, so records can't be added.
+    <button type="button" class="link" data-goto="settings">Add your domain in Settings</button></div>
+  <p class="hint" id="readonly" hidden>This server is a read-only copy of the primary. Make changes there.</p>
+  <form class="add" id="add" autocomplete="off">
+    <input class="mono" name="name" placeholder="grafana.home.lan or *.home.lan" aria-label="Name" required>
+    <input class="mono" name="value" placeholder="192.168.1.5 or traefik.home.lan" aria-label="Points to" required>
+    <input class="c-comment" name="comment" placeholder="Comment (optional)" aria-label="Comment">
+    <button class="primary" type="submit">Add record</button>
+  </form>
+  <p class="hint" id="hint">An IP makes an A record (a name can have one IPv4 and one IPv6 address), a hostname makes a CNAME, and a name starting with <b>*.</b> covers a whole domain.</p>
+
+  <div class="tools">
+    <input type="search" id="q" placeholder="Filter by name, IP or container" aria-label="Filter records">
+    <div class="filters" role="group" aria-label="Record source">
+      <button type="button" data-src="" aria-pressed="true">All</button>
+      <button type="button" data-src="manual" aria-pressed="false">Manual</button>
+      <button type="button" data-src="docker" aria-pressed="false">Docker</button>
+    </div>
+    <span class="count" id="count"></span>
+  </div>
+
+  <div id="records"></div>
+
+  <form class="check" id="check" autocomplete="off">
+    <label for="check-name">Check a name</label>
+    <input class="mono" id="check-name" name="name" placeholder="grafana.home.lan" spellcheck="false" required>
+    <button type="submit">Check</button>
+    <span class="hint" id="check-result" aria-live="polite"></span>
+  </form>
+  </div>
+  </div>
+</main>
+
+<script src="app.js"></script>
+</body>
+</html>

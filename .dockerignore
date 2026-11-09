@@ -1,0 +1,8 @@
+.git
+data
+dnsmasq.d
+lds_token.txt
+*.pem
+*.md
+.github
+docker-compose*.yml

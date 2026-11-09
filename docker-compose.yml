@@ -1,0 +1,77 @@
+services:
+  lds:
+    build: .
+    image: lds:latest
+    container_name: lds
+    restart: unless-stopped
+    # Host networking puts dnsmasq on port 53 of this machine and lets it see
+    # real client IPs. Free port 53 first (stop Pi-hole, and systemd-resolved's
+    # stub listener if your distro runs it).
+    network_mode: host
+    depends_on: [docker-proxy]
+
+    # Hardening: read-only filesystem, no privilege escalation, and only the
+    # capabilities LDS needs: bind port 53, let dnsmasq switch to its own
+    # user, and KILL so LDS can restart dnsmasq after that switch (without it,
+    # wildcard, alias and settings changes can't be applied).
+    read_only: true
+    tmpfs: [/tmp]
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE, SETUID, SETGID, KILL]
+
+    # Everything below is optional: LDS starts with no settings at all. See
+    # "Basic configuration" in the README for what each one unlocks. Most can
+    # also be changed later on the dashboard's Settings page.
+    environment:
+      # Reach Docker through the filtering proxy below, never the raw socket.
+      DOCKER_HOST: unix:///run/docker-proxy/docker.sock
+      # The domains LDS answers for (or set them under Settings).
+      # LDS_ZONES: home.lan
+      # IP of the machine running Traefik; turns on Docker discovery (or set it under Settings).
+      # LDS_DOCKER_TARGET: 192.168.1.5
+      # Web page and API. Tip: use this machine's LAN IP, e.g. 192.168.1.5:5380.
+      # LDS_HTTP_LISTEN: ":5380"
+      # Your own token. Without one, LDS generates one in ./data/admin-token.
+      # LDS_TOKEN_FILE: /run/secrets/lds_token
+    # secrets: [lds_token]
+    volumes:
+      - ./data:/data
+      # The proxy's socket (see below).
+      - docker-proxy:/run/docker-proxy:ro
+      # Optional: your own dnsmasq settings (*.conf).
+      - ./dnsmasq.d:/etc/dnsmasq.d:ro
+
+  # Mounting docker.sock straight into LDS would hand it full control of
+  # Docker (":ro" doesn't limit the API). This proxy only lets two read-only
+  # requests through: the container list and the event stream. It has no
+  # network at all: LDS talks to it over a socket file in a shared volume,
+  # so nothing else on this machine or the network can reach it.
+  docker-proxy:
+    image: wollomatic/socket-proxy:1.13.2@sha256:ff95d6ff6c27853005ef85eb8f4ab5923dc3d2f1e055f98fb6aeeaceec3fe848
+    container_name: lds-docker-proxy
+    restart: unless-stopped
+    command:
+      - -loglevel=info
+      - -allowGET=(/v1\.[0-9]{1,2})?/(containers/json|events)
+      - -proxysocketendpoint=/proxy/docker.sock
+    # Root inside the container, but with every capability removed: enough to
+    # open docker.sock on any distro without knowing its "docker" group ID.
+    user: "0:0"
+    network_mode: none
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - docker-proxy:/proxy
+
+volumes:
+  docker-proxy:
+
+# To use your own token instead of the generated one, create it with
+#   openssl rand -hex 32 > lds_token.txt && chmod 600 lds_token.txt
+# then uncomment LDS_TOKEN_FILE and "secrets" above, and this block:
+# secrets:
+#   lds_token:
+#     file: ./lds_token.txt
