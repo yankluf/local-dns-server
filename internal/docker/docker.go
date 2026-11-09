@@ -25,9 +25,9 @@ import (
 
 // Labels that control discovery on a container.
 const (
-	LabelEnable = "localdns.enable" // "false" skips the container
-	LabelTarget = "localdns.target" // overrides the IP for this container's hosts
-	LabelHosts  = "localdns.hosts"  // extra comma-separated hostnames
+	LabelEnable = "lds.enable" // "false" skips the container
+	LabelTarget = "lds.target" // overrides the IP for this container's hosts
+	LabelHosts  = "lds.hosts"  // extra comma-separated hostnames
 )
 
 // Status describes the watcher.
@@ -54,7 +54,7 @@ type Watcher struct {
 func NewWatcher(cfg config.Docker, st *store.Store) (*Watcher, error) {
 	w := &Watcher{cfg: cfg, store: st, status: Status{Enabled: cfg.Enabled, Target: cfg.Target}}
 	if _, err := netip.ParseAddr(cfg.Target); err != nil {
-		return nil, fmt.Errorf("LOCALDNS_DOCKER_TARGET must be an IP address: %w", err)
+		return nil, fmt.Errorf("LDS_DOCKER_TARGET must be an IP address: %w", err)
 	}
 	u, err := url.Parse(cfg.Host)
 	if err != nil {

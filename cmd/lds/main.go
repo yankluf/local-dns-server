@@ -1,4 +1,4 @@
-// Command localdns is a small DNS server for a home lab: dnsmasq serves the
+// Command lds is LDS (Local DNS Server), a small DNS server for a home lab: dnsmasq serves the
 // records, a web UI shows them, and this same binary is the CLI that edits them.
 package main
 
@@ -28,23 +28,23 @@ import (
 
 var version = "dev"
 
-const usage = `localdns manages local DNS records served by dnsmasq.
+const usage = `LDS (Local DNS Server) manages local DNS records served by dnsmasq.
 
 Usage:
-  localdns serve                         Run the DNS server and web UI
-  localdns add <name> <value> [-c text]  Add a record
-  localdns rm <name|id>                  Remove a record
-  localdns list [--json] [--source s]    List records (s: manual or docker)
-  localdns import <file>                 Import records from Pi-hole or a hosts file
-  localdns version
+  lds serve                         Run the DNS server and web UI
+  lds add <name> <value> [-c text]  Add a record
+  lds rm <name|id>                  Remove a record
+  lds list [--json] [--source s]    List records (s: manual or docker)
+  lds import <file>                 Import records from Pi-hole or a hosts file
+  lds version
 
 The record type comes from the name and value:
-  localdns add '*.home.lan' 192.168.1.5          wildcard: home.lan and every subdomain
-  localdns add nas.home.lan 192.168.1.10         A record (an IPv6 address makes AAAA)
-  localdns add grafana.home.lan nas.home.lan     CNAME to another local record
+  lds add '*.home.lan' 192.168.1.5          wildcard: home.lan and every subdomain
+  lds add nas.home.lan 192.168.1.10         A record (an IPv6 address makes AAAA)
+  lds add grafana.home.lan nas.home.lan     CNAME to another local record
 
-Client commands talk to the server at --server, $LOCALDNS_URL or
-http://127.0.0.1:5380, sending $LOCALDNS_TOKEN if the server requires one.
+Client commands talk to the server at --server, $LDS_URL or
+http://127.0.0.1:5380, sending $LDS_TOKEN if the server requires one.
 `
 
 func main() {
@@ -116,7 +116,7 @@ func serve() error {
 		}
 		log.Printf("docker discovery on (%s), Traefik hosts -> %s", cfg.Docker.Host, cfg.Docker.Target)
 	} else {
-		log.Print("docker discovery off (set LOCALDNS_DOCKER_TARGET to enable)")
+		log.Print("docker discovery off (set LDS_DOCKER_TARGET to enable)")
 	}
 
 	apply()
@@ -163,12 +163,12 @@ func serve() error {
 
 // clientFlags adds --server and --token to fs and returns a constructor.
 func clientFlags(fs *flag.FlagSet) func() *client.Client {
-	def := os.Getenv("LOCALDNS_URL")
+	def := os.Getenv("LDS_URL")
 	if def == "" {
 		def = "http://127.0.0.1:5380"
 	}
-	srv := fs.String("server", def, "localdns server URL")
-	tok := fs.String("token", os.Getenv("LOCALDNS_TOKEN"), "API token")
+	srv := fs.String("server", def, "lds server URL")
+	tok := fs.String("token", os.Getenv("LDS_TOKEN"), "API token")
 	return func() *client.Client { return client.New(*srv, *tok) }
 }
 
@@ -198,7 +198,7 @@ func add(args []string) error {
 		return err
 	}
 	if len(pos) != 2 {
-		return errors.New("usage: localdns add <name> <value> [-c comment]")
+		return errors.New("usage: lds add <name> <value> [-c comment]")
 	}
 	r, err := newClient().Add(pos[0], pos[1], *comment)
 	if err != nil {
@@ -219,7 +219,7 @@ func remove(args []string) error {
 		return err
 	}
 	if len(pos) == 0 {
-		return errors.New("usage: localdns rm <name|id>...")
+		return errors.New("usage: lds rm <name|id>...")
 	}
 	c := newClient()
 	for _, key := range pos {
@@ -287,7 +287,7 @@ func importFile(args []string) error {
 		return err
 	}
 	if len(pos) != 1 {
-		return errors.New(`usage: localdns import [--dry-run] <file>
+		return errors.New(`usage: lds import [--dry-run] <file>
 
 Understands:
   Pi-hole v6 pihole.toml             (dns.hosts and dns.cnameRecords)

@@ -33,13 +33,13 @@ func TestRecordsFromContainers(t *testing.T) {
 			"traefik.http.routers.off.rule": "Host(`off.home.lan`)",
 		}},
 		{Names: []string{"/skipme"}, Labels: map[string]string{
-			"localdns.enable":                  "false",
+			"lds.enable":                       "false",
 			"traefik.http.routers.skipme.rule": "Host(`skip.home.lan`)",
 		}},
 		{Names: []string{"/other"}, Labels: map[string]string{
 			"traefik.http.routers.o.rule": "Host(`other.home.lan`) || Host(`grafana.home.lan`)",
-			"localdns.target":             "10.0.0.9",
-			"localdns.hosts":              "extra.home.lan, ",
+			"lds.target":                  "10.0.0.9",
+			"lds.hosts":                   "extra.home.lan, ",
 		}},
 	}
 	got := map[string]string{}

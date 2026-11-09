@@ -53,7 +53,7 @@ func (s *Server) auth(next http.HandlerFunc) http.HandlerFunc {
 		if s.Token != "" {
 			got := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 			if subtle.ConstantTimeCompare([]byte(got), []byte(s.Token)) != 1 {
-				writeError(w, http.StatusUnauthorized, errors.New("missing or wrong token (set LOCALDNS_TOKEN)"))
+				writeError(w, http.StatusUnauthorized, errors.New("missing or wrong token (set LDS_TOKEN)"))
 				return
 			}
 		}

@@ -1,4 +1,4 @@
-// Package store keeps the DNS records served by localdns.
+// Package store keeps the DNS records served by lds.
 //
 // Manual records (added from the CLI, API or web UI) are persisted to a JSON
 // file. Docker records are discovered from container labels at runtime and

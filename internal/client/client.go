@@ -1,4 +1,4 @@
-// Package client is the HTTP client the CLI uses to talk to `localdns serve`.
+// Package client is the HTTP client the CLI uses to talk to `lds serve`.
 package client
 
 import (
@@ -14,7 +14,7 @@ import (
 	"github.com/yankluf/local-dns-server/internal/store"
 )
 
-// Client talks to the localdns API.
+// Client talks to the lds API.
 type Client struct {
 	BaseURL string
 	Token   string
@@ -68,7 +68,7 @@ func (c *Client) do(method, path string, in, out any) error {
 	}
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
-		return fmt.Errorf("can't reach localdns at %s (is `localdns serve` running? set --server or LOCALDNS_URL): %w", c.BaseURL, err)
+		return fmt.Errorf("can't reach lds at %s (is `lds serve` running? set --server or LDS_URL): %w", c.BaseURL, err)
 	}
 	defer resp.Body.Close()
 	data, err := io.ReadAll(resp.Body)

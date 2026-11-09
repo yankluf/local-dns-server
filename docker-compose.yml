@@ -1,8 +1,8 @@
 services:
-  localdns:
+  lds:
     build: .
-    image: localdns:latest
-    container_name: localdns
+    image: lds:latest
+    container_name: lds
     restart: unless-stopped
     # Host networking puts dnsmasq on port 53 of every host interface and lets
     # dnsmasq see real client IPs. Free port 53 first (stop Pi-hole, and
@@ -11,13 +11,13 @@ services:
     environment:
       # IP address of the machine running Traefik. Every hostname found in a
       # container's Traefik rule (Host(`app.home.lan`)) resolves to it.
-      LOCALDNS_DOCKER_TARGET: 192.168.1.5
+      LDS_DOCKER_TARGET: 192.168.1.5
       # Where everything that isn't a local record gets forwarded.
-      LOCALDNS_UPSTREAMS: 1.1.1.1,1.0.0.1,9.9.9.9
+      LDS_UPSTREAMS: 1.1.1.1,1.0.0.1,9.9.9.9
       # Web UI and API.
-      LOCALDNS_HTTP_LISTEN: ":5380"
-      # Uncomment to require a token for changes (CLI reads LOCALDNS_TOKEN too).
-      # LOCALDNS_TOKEN: change-me
+      LDS_HTTP_LISTEN: ":5380"
+      # Uncomment to require a token for changes (CLI reads LDS_TOKEN too).
+      # LDS_TOKEN: change-me
     volumes:
       - ./data:/data
       # Optional: your own dnsmasq settings (*.conf), e.g. DHCP.
